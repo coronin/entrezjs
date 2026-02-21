@@ -21,6 +21,9 @@ entrezjs/
 ├── api_keys_pending.json # Pending email verifications
 ├── api_keys.backup.*.json # Backups with timestamps
 ├── trending.json        # Daily trending data
+├── bees.json           # Registered bee servers (queen only)
+├── shared_cache.json    # Shared cache metadata
+├── banned_ips.json     # Blocked IPs
 ├── Bio/                 # Biopython library (Entrez module)
 ├── json_endpoint/       # Core API endpoint module (Python)
 ├── devdb/               # Developer registration module
@@ -42,13 +45,14 @@ The Node.js version (`server.js`) provides all the functionality of the original
 | **Caching** | 24-hour in-memory cache with LRU eviction |
 | **Memory Management** | Auto cleanup when memory > 80% |
 | **Email Verification** | Registration requires email verification |
-| **API Key Rotation** | Support multiple NCBI API keys |
+| **API Key Rotation** | Adaptive - only use keys when > 5 req/s |
 | **JSONP** | Supports `callback` parameter |
 | **Persistence** | API keys persist to JSON files |
 | **Backup** | Auto backup every 24h + on shutdown/crash |
 | **Rate Limiting** | 30 requests/minute per IP |
 | **Security Headers** | XSS, frame protection enabled |
 | **Daily Trending** | Top 10 search terms + PMIDs, Slack webhook |
+| **Distributed Mode** | Queen/Bee architecture for multi-server |
 
 ### Running the Node.js Server
 
@@ -65,13 +69,84 @@ node test.js
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PORT` | Server port | 8080 |
+| `SERVER_CODE_NAME` | Server codename (a-z0-9, no spaces) | entrezjs1 |
+| `SERVER_ROLE` | Role: `queen`, `bee`, or `standalone` | standalone |
+| `QUEEN_HOST` | Queen server IP (for bee) | - |
+| `QUEEN_PORT` | Queen server port (for bee) | 8080 |
+| `FIRST_QUEEN_HOST` | First queen IP (for second queen) | - |
+| `FIRST_QUEEN_PORT` | First queen port (for second queen) | 8080 |
 | `SERVER_URL` | Server URL for email verification | http://localhost:8080 |
-| `ENTREZ_API_KEYS` | Comma-separated API keys for rotation | (none) |
-| `SLACK_WEBHOOK_URL` | Slack webhook for daily trending | (none) |
-| `SMTP_HOST` | SMTP server for email | (none) |
+| `ENTREZ_API_KEYS` | Comma-separated API keys for rotation | - |
+| `SLACK_WEBHOOK_URL` | Slack webhook for daily trending | - |
+| `SMTP_HOST` | SMTP server for email | - |
 | `SMTP_PORT` | SMTP port | 587 |
-| `SMTP_USER` | SMTP username | (none) |
-| `SMTP_PASS` | SMTP password | (none) |
+| `SMTP_USER` | SMTP username | - |
+| `SMTP_PASS` | SMTP password | - |
+
+## Distributed System (Queen/Bee)
+
+### Architecture
+
+```
+┌─────────────┐
+│   QUEEN    │ - API key backup
+│            │ - Blocked IP aggregation
+│            │ - Daily trending generation
+│            │ - Cache coordination
+└─────┬───────┘
+      │ sync hourly
+      ▼
+┌─────────────┐
+│    BEE      │ - Serve API requests
+│    BEE      │ - Report new API keys
+│    BEE      │ - Report blocked IPs
+└─────────────┘
+```
+
+### Queen Configuration
+
+```bash
+# Queen needs: codename, API keys, webhook
+export SERVER_ROLE=queen
+export SERVER_CODE_NAME=queen01
+export ENTREZ_API_KEYS="key1,key2,key3"
+export SLACK_WEBHOOK_URL="https://hooks.slack.com/..."
+```
+
+### Bee Configuration
+
+```bash
+# Bee needs: codename, queen address
+export SERVER_ROLE=bee
+export SERVER_CODE_NAME=bee01
+export QUEEN_HOST=192.168.1.100
+export QUEEN_PORT=8080
+```
+
+### Second Queen (Failover)
+
+```bash
+# Second queen joins by specifying first queen
+export SERVER_ROLE=queen
+export SERVER_CODE_NAME=queen02
+export FIRST_QUEEN_HOST=192.168.1.100
+export FIRST_QUEEN_PORT=8080
+```
+
+On second queen join:
+1. First queen broadcasts new queen address to all bees
+2. First queen becomes bee
+3. Second queen imports API keys and takes over
+
+### Internal Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/internal/register` | Bee registers with queen |
+| `/internal/sync` | Bee syncs API keys, blocked IPs |
+| `/internal/status` | Bee status for queen collection |
+| `/internal/queen-update` | Broadcast new queen address |
+| `/internal/queen-handover` | First queen hands over to second |
 
 ## Available Endpoints
 
@@ -93,6 +168,7 @@ node test.js
 | `/status/memcache` | Cache and memory status |
 | `/status/trending` | Daily trending data |
 | `/status/keys` | API key usage statistics |
+| `/status/security` | IP ban status & violations |
 
 ## Registration Flow
 
@@ -117,6 +193,8 @@ Optimized dictionary format (not arrays):
 - **Max Cache Entries**: 10,000
 - **Memory Threshold**: Auto cleanup at >80% heap usage
 - **Rate Limit**: 30 requests/minute per IP
+- **API Key Threshold**: Use keys when > 5 req/s
+- **Sync Interval**: 1 hour (bee→queen)
 - **Backup**: Every 24h + on SIGINT/SIGTERM/uncaughtException
 
 ## API Usage
@@ -139,6 +217,7 @@ curl "http://localhost:8080/esearch?apikey=YOUR_API_KEY&db=pubterm=cancer&callba
 curl http://localhost:8080/status/memcache
 curl http://localhost:8080/status/trending
 curl http://localhost:8080/status/keys
+curl http://localhost:8080/status/security
 ```
 
 ## Security
@@ -146,5 +225,7 @@ curl http://localhost:8080/status/keys
 - API key required for all main endpoints
 - Email verification required for new registrations
 - Rate limiting (30 req/min per IP)
+- IP banning (5+ violations = ban single IP)
+- Subnet banning (10+ violations in /24 or /48 = ban subnet)
 - Security headers (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection)
 - WHATWG URL API (no deprecated url.parse)

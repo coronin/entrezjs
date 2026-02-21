@@ -1,8 +1,8 @@
-# API Keys (generated at runtime)
+# Stores (generated at runtime)
 api_keys.json
 api_keys.backup.*.json
 api_keys_pending.json
-
+bees.json
 trending.json
 
 # Security
@@ -22,3 +22,4 @@ yarn-error.log
 .idea/
 *.swp
 *.swo
+.claude/

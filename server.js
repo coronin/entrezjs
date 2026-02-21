@@ -26,7 +26,30 @@ const CONFIG = {
     // Multiple API keys for rotation (for higher rate limits)
     entrezApiKeys: (process.env.ENTREZ_API_KEYS || '').split(',').filter(k => k.trim()),
     trendingFile: path.join(__dirname, 'trending.json'),
-    trendingUpdateInterval: 24 * 60 * 60 * 1000 // 24 hours
+    trendingUpdateInterval: 24 * 60 * 60 * 1000, // 24 hours
+
+    // ============================================================
+    // Distributed System Configuration (Queen/Bee)
+    // ============================================================
+    // Role: 'queen' or 'bee' (default: standalone mode, no sync)
+    serverRole: process.env.SERVER_ROLE || 'standalone',
+
+    // Queen server address (for bee to connect)
+    queenHost: process.env.QUEEN_HOST || '',
+    queenPort: process.env.QUEEN_PORT || '8080',
+
+    // For second queen joining (optional)
+    firstQueenHost: process.env.FIRST_QUEEN_HOST || '',
+    firstQueenPort: process.env.FIRST_QUEEN_PORT || '8080',
+
+    // Sync interval (1 hour)
+    syncInterval: 60 * 60 * 1000,
+
+    // Bee list file (queen only)
+    beesFile: path.join(__dirname, 'bees.json'),
+
+    // Shared cache file
+    sharedCacheFile: path.join(__dirname, 'shared_cache.json')
 };
 
 // Validate server codename (lowercase letters and numbers only, no spaces)
@@ -925,11 +948,45 @@ function checkApiKey(req, res, callback) {
     callback(query);
 }
 
-// API Key rotation mechanism
+// ============================================================
+// API Key rotation mechanism - adaptive based on request rate
+// ============================================================
+
 let currentKeyIndex = 0;
 const keyUsageCount = new Map();
 
+// Request rate tracking
+const requestTimestamps = [];
+const RATE_WINDOW_MS = 1000; // 1 second window
+const API_KEY_THRESHOLD = 5; // Use API keys when > 5 req/s (NCBI allows 10/s with key)
+
+// Track request timestamps for rate calculation
+function recordRequest() {
+    const now = Date.now();
+    requestTimestamps.push(now);
+
+    // Remove timestamps older than the window
+    while (requestTimestamps.length > 0 && now - requestTimestamps[0] > RATE_WINDOW_MS) {
+        requestTimestamps.shift();
+    }
+}
+
+// Get current request rate (requests per second)
+function getRequestRate() {
+    return requestTimestamps.length;
+}
+
+// Check if we should use API keys based on rate
+function shouldUseApiKeys() {
+    return getRequestRate() > API_KEY_THRESHOLD && CONFIG.entrezApiKeys.length > 0;
+}
+
 function getNextApiKey() {
+    // Don't use API keys if rate is low (save for when needed)
+    if (!shouldUseApiKeys()) {
+        return null;
+    }
+
     if (CONFIG.entrezApiKeys.length === 0) {
         return null;
     }
@@ -955,8 +1012,11 @@ function getKeyUsageStats() {
 
 // Make request to NCBI E-utilities
 async function ncbiRequest(entrezFunction, params) {
-    // Use API key rotation if available
-    const apiKey = getNextApiKey();
+    // Record this request for rate tracking
+    recordRequest();
+
+    // Use API key rotation only when rate is high
+    const apiKey = shouldUseApiKeys() ? getNextApiKey() : null;
     if (apiKey) {
         params.api_key = apiKey;
     }
@@ -1523,6 +1583,12 @@ async function handleRequest(req, res) {
         return;
     }
 
+    // Handle internal distributed system routes
+    if (pathname.startsWith('/internal/')) {
+        handleInternalRequest(req, res, pathname, query);
+        return;
+    }
+
     try {
         // Routes
         switch (pathname) {
@@ -1594,6 +1660,9 @@ async function handleRequest(req, res) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     count: CONFIG.entrezApiKeys.length,
+                    requestRate: getRequestRate(),
+                    apiKeyThreshold: API_KEY_THRESHOLD,
+                    apiKeysInUse: shouldUseApiKeys(),
                     usage: getKeyUsageStats()
                 }));
                 break;
@@ -1626,6 +1695,465 @@ async function handleRequest(req, res) {
     }
 }
 
+// ============================================================
+// Distributed System: Queen/Bee Communication
+// ============================================================
+
+// Bee registration (for queen to track all bees)
+class BeeRegistry {
+    constructor() {
+        this.bees = new Map(); // codename -> { host, port, lastSeen }
+        this.load();
+    }
+
+    load() {
+        try {
+            if (fs.existsSync(CONFIG.beesFile)) {
+                const data = JSON.parse(fs.readFileSync(CONFIG.beesFile, 'utf8'));
+                this.bees = new Map(Object.entries(data));
+                console.log(`[BEE] Loaded ${this.bees.size} bees`);
+            }
+        } catch (e) {
+            console.log('[BEE] No bees file, starting fresh');
+        }
+    }
+
+    save() {
+        try {
+            fs.writeFileSync(CONFIG.beesFile, JSON.stringify(Object.fromEntries(this.bees), null, 2));
+        } catch (e) {
+            console.error(`[BEE] Failed to save bees: ${e.message}`);
+        }
+    }
+
+    register(codename, host, port) {
+        this.bees.set(codename, { host, port, lastSeen: Date.now() });
+        this.save();
+        console.log(`[BEE] Registered bee: ${codename} at ${host}:${port}`);
+    }
+
+    unregister(codename) {
+        this.bees.delete(codename);
+        this.save();
+    }
+
+    getAll() {
+        return Object.fromEntries(this.bees);
+    }
+
+    heartbeat(codename) {
+        if (this.bees.has(codename)) {
+            const bee = this.bees.get(codename);
+            bee.lastSeen = Date.now();
+            this.save();
+        }
+    }
+}
+
+const beeRegistry = new BeeRegistry();
+
+// Current queen info (for bees)
+let currentQueen = {
+    host: CONFIG.queenHost,
+    port: CONFIG.queenPort,
+    codename: null
+};
+
+// HTTP helper for inter-server communication
+function httpRequest(host, port, path, method = 'GET', data = null) {
+    return new Promise((resolve, reject) => {
+        const options = {
+            hostname: host,
+            port: port,
+            path: path,
+            method: method,
+            headers: {
+                'Content-Type': 'application/json',
+                'User-Agent': 'EntrezJS/2.0-Distributed'
+            }
+        };
+
+        const req = http.request(options, (res) => {
+            let responseData = '';
+            res.on('data', chunk => responseData += chunk);
+            res.on('end', () => {
+                try {
+                    resolve(JSON.parse(responseData));
+                } catch (e) {
+                    resolve(responseData);
+                }
+            });
+        });
+
+        req.on('error', reject);
+        if (data) {
+            req.write(JSON.stringify(data));
+        }
+        req.end();
+    });
+}
+
+// Sync data to/from queen
+async function syncToQueen() {
+    if (CONFIG.serverRole !== 'bee' || !currentQueen.host) {
+        return;
+    }
+
+    try {
+        console.log(`[SYNC] Syncing to queen at ${currentQueen.host}:${currentQueen.port}`);
+
+        // 1. Report new API keys to queen
+        const myApiKeys = [];
+        for (const [key, value] of apiKeyStore.keys) {
+            if (value.verified) {
+                myApiKeys.push({
+                    key: key,
+                    toolId: value.toolId,
+                    email: value.email
+                });
+            }
+        }
+
+        // 2. Report blocked IPs to queen
+        const myBlockedIps = Array.from(ipBanManager.bannedIps);
+
+        // 3. Compress and send cache data (only small metadata, not full data)
+        const cacheMeta = [];
+        for (const [key, entry] of entrezCache.cache) {
+            cacheMeta.push({
+                key: key,
+                expires: entry.expires,
+                size: JSON.stringify(entry.data).length
+            });
+        }
+
+        // Send sync data
+        const result = await httpRequest(
+            currentQueen.host,
+            currentQueen.port,
+            `/internal/sync?bee=${CONFIG.serverCodename}`,
+            'POST',
+            {
+                apiKeys: myApiKeys,
+                blockedIps: myBlockedIps,
+                cacheMeta: cacheMeta,
+                timestamp: Date.now()
+            }
+        );
+
+        console.log(`[SYNC] Sync result:`, result);
+
+        // If queen responded with new data, update local
+        if (result.apiKeys) {
+            // Merge API keys from queen
+            for (const ak of result.apiKeys) {
+                if (!apiKeyStore.keys.has(ak.key)) {
+                    apiKeyStore.keys.set(ak.key, {
+                        contactName: 'synced',
+                        email: ak.email,
+                        toolId: ak.toolId,
+                        verified: true,
+                        createdOn: new Date().toISOString()
+                    });
+                }
+            }
+            apiKeyStore.save();
+        }
+
+        if (result.blockedIps) {
+            // Merge blocked IPs from queen
+            for (const ip of result.blockedIps) {
+                if (!ipBanManager.bannedIps.has(ip)) {
+                    ipBanManager.banIp(ip);
+                }
+            }
+        }
+
+    } catch (e) {
+        console.error(`[SYNC] Failed to sync: ${e.message}`);
+    }
+}
+
+// Sync data from queen (for bees to pull)
+async function syncFromQueen() {
+    // This is called by queen to pull data from bees
+}
+
+// Queen collects data from all bees
+async function collectFromBees() {
+    if (CONFIG.serverRole !== 'queen') return;
+
+    console.log('[QUEEN] Collecting data from bees...');
+
+    for (const [codename, bee] of beeRegistry.bees) {
+        try {
+            const response = await httpRequest(
+                bee.host,
+                bee.port,
+                `/internal/status?queen=${CONFIG.serverCodename}`
+            );
+
+            // Merge API keys
+            if (response.apiKeys) {
+                for (const ak of response.apiKeys) {
+                    if (!apiKeyStore.keys.has(ak.key)) {
+                        apiKeyStore.keys.set(ak.key, {
+                            contactName: 'synced',
+                            email: ak.email,
+                            toolId: ak.toolId,
+                            verified: true,
+                            createdOn: new Date().toISOString()
+                        });
+                    }
+                }
+            }
+
+            // Merge blocked IPs
+            if (response.blockedIps) {
+                for (const ip of response.blockedIps) {
+                    ipBanManager.banIp(ip);
+                }
+            }
+
+            console.log(`[QUEEN] Collected from ${codename}`);
+        } catch (e) {
+            console.error(`[QUEEN] Failed to collect from ${codename}: ${e.message}`);
+        }
+    }
+
+    apiKeyStore.save();
+    ipBanManager.saveBannedIps();
+}
+
+// Queen election: second queen joins
+async function handleQueenElection() {
+    if (CONFIG.serverRole !== 'queen' || !CONFIG.firstQueenHost) {
+        return;
+    }
+
+    console.log(`[QUEEN] Joining as new queen, connecting to first queen at ${CONFIG.firstQueenHost}:${CONFIG.firstQueenPort}`);
+
+    try {
+        // Get API keys from first queen
+        const firstQueenData = await httpRequest(
+            CONFIG.firstQueenHost,
+            CONFIG.firstQueenPort,
+            `/internal/queen-handover?newQueen=${CONFIG.serverCodename}`
+        );
+
+        if (firstQueenData.apiKeys) {
+            for (const [key, value] of Object.entries(firstQueenData.apiKeys)) {
+                apiKeyStore.keys.set(key, value);
+            }
+            apiKeyStore.save();
+            console.log(`[QUEEN] Imported ${Object.keys(firstQueenData.apiKeys).length} API keys`);
+        }
+
+        // Get trending data
+        if (firstQueenData.trending) {
+            Object.assign(trendingData, firstQueenData.trending);
+            saveTrendingData();
+        }
+
+        // Get blocked IPs
+        if (firstQueenData.blockedIps) {
+            for (const ip of firstQueenData.blockedIps) {
+                ipBanManager.banIp(ip);
+            }
+        }
+
+        // Tell first queen to become bee and broadcast to all bees
+        console.log('[QUEEN] First queen should now become bee');
+
+    } catch (e) {
+        console.error(`[QUEEN] Failed to join: ${e.message}`);
+    }
+}
+
+// Broadcast new queen address to all bees
+async function broadcastNewQueen(newQueenHost, newQueenPort) {
+    console.log(`[QUEEN] Broadcasting new queen address to all bees`);
+
+    for (const [codename, bee] of beeRegistry.bees) {
+        try {
+            await httpRequest(
+                bee.host,
+                bee.port,
+                '/internal/queen-update',
+                'POST',
+                { host: newQueenHost, port: newQueenPort }
+            );
+            console.log(`[QUEEN] Notified ${codename} of new queen`);
+        } catch (e) {
+            console.error(`[QUEEN] Failed to notify ${codename}: ${e.message}`);
+        }
+    }
+}
+
+// Setup sync intervals based on role
+function setupDistributedSync() {
+    if (CONFIG.serverRole === 'bee' && CONFIG.queenHost) {
+        // Bee: sync to queen every hour
+        console.log(`[BEE] Will sync to queen at ${CONFIG.queenHost}:${CONFIG.queenPort}`);
+        setInterval(syncToQueen, CONFIG.syncInterval);
+    } else if (CONFIG.serverRole === 'queen') {
+        // Queen: collect from bees every hour
+        console.log('[QUEEN] Will collect data from bees');
+        setInterval(collectFromBees, CONFIG.syncInterval);
+
+        // Check for second queen joining
+        if (CONFIG.firstQueenHost) {
+            handleQueenElection();
+        }
+    }
+}
+
+// Internal endpoints for queen-bee communication
+function handleInternalRequest(req, res, pathname, query) {
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    const path = urlObj.pathname;
+
+    // Bee registers with queen
+    if (path === '/internal/register' && CONFIG.serverRole === 'queen') {
+        const codename = query.bee;
+        const host = query.host;
+        const port = query.port || CONFIG.port;
+        beeRegistry.register(codename, host, port);
+        res.writeHead(200);
+        res.end(JSON.stringify({ success: true }));
+        return;
+    }
+
+    // Bee syncs data to queen
+    if (path.startsWith('/internal/sync') && CONFIG.serverRole === 'queen') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', async () => {
+            try {
+                const data = JSON.parse(body);
+                const beeCodename = query.bee;
+
+                // Update bee last seen
+                beeRegistry.heartbeat(beeCodename);
+
+                // Merge data
+                if (data.apiKeys) {
+                    for (const ak of data.apiKeys) {
+                        if (!apiKeyStore.keys.has(ak.key)) {
+                            apiKeyStore.keys.set(ak.key, {
+                                contactName: 'synced',
+                                email: ak.email,
+                                toolId: ak.toolId,
+                                verified: true,
+                                createdOn: new Date().toISOString()
+                            });
+                        }
+                    }
+                }
+
+                if (data.blockedIps) {
+                    for (const ip of data.blockedIps) {
+                        ipBanManager.banIp(ip);
+                    }
+                }
+
+                apiKeyStore.save();
+                ipBanManager.saveBannedIps();
+
+                // Return consolidated data
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+
+                // Get all API keys and blocked IPs to share
+                const allApiKeys = [];
+                for (const [key, value] of apiKeyStore.keys) {
+                    allApiKeys.push({ key, email: value.email, toolId: value.toolId });
+                }
+
+                res.end(JSON.stringify({
+                    apiKeys: allApiKeys,
+                    blockedIps: Array.from(ipBanManager.bannedIps)
+                }));
+            } catch (e) {
+                res.writeHead(500);
+                res.end(JSON.stringify({ error: e.message }));
+            }
+        });
+        return;
+    }
+
+    // Queen handover to new queen
+    if (path === '/internal/queen-handover' && CONFIG.serverRole === 'queen') {
+        const newQueen = query.newQueen;
+        console.log(`[QUEEN] Handover requested by ${newQueen}`);
+
+        // Get all data to transfer
+        const apiKeysData = {};
+        for (const [key, value] of apiKeyStore.keys) {
+            apiKeysData[key] = value;
+        }
+
+        // Broadcast new queen to all bees
+        const newQueenHost = req.headers.host.split(':')[0];
+        const newQueenPort = CONFIG.port;
+        broadcastNewQueen(newQueenHost, newQueenPort);
+
+        // Become bee
+        CONFIG.serverRole = 'bee';
+        currentQueen = { host: newQueenHost, port: newQueenPort, codename: newQueen };
+
+        console.log(`[QUEEN] Demoted to bee, new queen: ${newQueen}`);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            apiKeys: apiKeysData,
+            trending: trendingData,
+            blockedIps: Array.from(ipBanManager.bannedIps)
+        }));
+        return;
+    }
+
+    // Bee receives queen update
+    if (path === '/internal/queen-update' && CONFIG.serverRole === 'bee') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const data = JSON.parse(body);
+                currentQueen.host = data.host;
+                currentQueen.port = data.port;
+                console.log(`[BEE] Queen updated to ${data.host}:${data.port}`);
+                res.writeHead(200);
+                res.end(JSON.stringify({ success: true }));
+            } catch (e) {
+                res.writeHead(500);
+                res.end(JSON.stringify({ error: e.message }));
+            }
+        });
+        return;
+    }
+
+    // Status endpoint for queen to collect
+    if (path === '/internal/status' && CONFIG.serverRole === 'bee') {
+        const myApiKeys = [];
+        for (const [key, value] of apiKeyStore.keys) {
+            if (value.verified) {
+                myApiKeys.push({ key, email: value.email, toolId: value.toolId });
+            }
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            apiKeys: myApiKeys,
+            blockedIps: Array.from(ipBanManager.bannedIps)
+        }));
+        return;
+    }
+
+    // 404 for internal routes
+    res.writeHead(404);
+    res.end('Not Found');
+}
+
 // Create and start server
 const server = http.createServer(handleRequest);
 
@@ -1642,6 +2170,14 @@ server.listen(CONFIG.port, () => {
         ? `║                   EntrezAJAX 2 JS Server [${CONFIG.serverCodename}]`
         : `║                   EntrezAJAX 2 JS Server                    ║`;
 
+    // Role display
+    let roleInfo = '';
+    if (CONFIG.serverRole === 'queen') {
+        roleInfo = `║  Role: QUEEN (backup, trending, IP blocking)             ║`;
+    } else if (CONFIG.serverRole === 'bee') {
+        roleInfo = `║  Role: BEE -> queen: ${CONFIG.queenHost}:${CONFIG.queenPort}           ║`;
+    }
+
     console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ${titleLine}${' '.repeat(60 - titleLine.length)}║
@@ -1649,6 +2185,7 @@ ${titleLine}${' '.repeat(60 - titleLine.length)}║
 ╠═══════════════════════════════════════════════════════════╗
 ║  Server running at http://localhost:${CONFIG.port}                  ║
 ${codenameLine}
+${roleInfo}
 ║  Available endpoints:                                      ║
 ║    /espell          - Spelling suggestions                ║
 ║    /einfo           - Database information                ║
@@ -1669,6 +2206,11 @@ ${codenameLine}
 ║    /status/security - IP ban status & violations          ║
 ║                                                           ║
 ╠═══════════════════════════════════════════════════════════╣
+║  DISTRIBUTED:                                             ║
+║    Internal: /internal/register, /internal/sync           ║
+║    /internal/status, /internal/queen-update               ║
+║                                                           ║
+╠═══════════════════════════════════════════════════════════╣
 ║  SECURITY:                                                ║
 ║    - API key required for all main endpoints              ║
 ║    - Email verification required for new registrations    ║
@@ -1683,6 +2225,9 @@ ${codenameLine}
 ║  Cache time: ${CONFIG.cacheTime} seconds (${CONFIG.cacheTime / 3600} hours)              ║
 ╚═══════════════════════════════════════════════════════════╝
     `);
+
+    // Setup distributed sync
+    setupDistributedSync();
 });
 
 // Handle graceful shutdown
