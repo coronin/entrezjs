@@ -1,0 +1,45 @@
+<!-- NLM SupplementalRecordSet DTD -->
+<!-- MeSH DTD file for Supplementary Concept Records. -->
+<!-- Author: MeSH				-->
+<!-- Effective: 05/01/2024			-->
+
+<!-- ================================================================= -->
+<!--             Revision Notes Section
+  Nothing significant from 2023 to 2024
+
+
+-->
+<!-- ================================================================= -->
+
+<!ENTITY  % DescriptorRecordSet SYSTEM "nlmdescriptorrecordset_20240501.dtd">
+%DescriptorRecordSet;
+
+<!ENTITY  % ChemicalReference "(SupplementalRecordUI, SupplementalRecordName)">
+<!ELEMENT ChemicalReferredTo (%ChemicalReference;) >
+
+<!ELEMENT SupplementalRecordSet (SupplementalRecord*)>
+<!ATTLIST SupplementalRecordSet LanguageCode (eng) #REQUIRED>
+<!ELEMENT SupplementalRecord (%ChemicalReference;,
+                            DateCreated,
+                            DateRevised?,  
+                            Note?,
+                            Frequency?,
+                            PreviousIndexingList?,
+                            HeadingMappedToList+,
+                            IndexingInformationList*,
+                            PharmacologicalActionList?,
+                            SourceList*,
+                            ConceptList) >
+<!ATTLIST SupplementalRecord SCRClass (1 | 2 | 3| 4 | 5 | 6)  "1">
+
+<!ELEMENT Note (#PCDATA)>
+<!ELEMENT SourceList (Source+)>
+<!ELEMENT Source (#PCDATA)>
+<!ELEMENT Frequency (#PCDATA)>
+<!ELEMENT HeadingMappedToList (HeadingMappedTo+)>
+<!ELEMENT HeadingMappedTo (DescriptorReferredTo,QualifierReferredTo?) >
+<!ELEMENT IndexingInformationList (IndexingInformation+)>
+<!ELEMENT IndexingInformation (DescriptorReferredTo?,QualifierReferredTo?,ChemicalReferredTo?)>
+<!ELEMENT SupplementalRecordUI (#PCDATA) >
+<!ELEMENT SupplementalRecordName (String) >
+
