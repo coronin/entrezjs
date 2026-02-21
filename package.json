@@ -1,0 +1,19 @@
+{
+  "name": "entrezjs",
+  "version": "2.0.0",
+  "description": "EntrezAJAX 2 JS (EntrezJS) - NCBI Entrez API proxy with JSON/JSONP and caching",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "keywords": [
+    "bioinformatics",
+    "ncbi",
+    "entrez",
+    "api",
+    "json"
+  ],
+  "author": "",
+  "license": "Apache-2.0"
+}

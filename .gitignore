@@ -1,0 +1,21 @@
+# API Keys (generated at runtime)
+api_keys.json
+api_keys.backup.*.json
+api_keys_pending.json
+
+trending.json
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
