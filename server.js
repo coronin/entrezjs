@@ -11,6 +11,7 @@ const path = require('path');
 // Configuration
 const CONFIG = {
     port: process.env.PORT || 8080,
+    serverCodename: process.env.SERVER_CODE_NAME || 'entrezjs1',
     email: 'n.j.loman@bham.ac.uk',
     cacheTime: 60 * 60 * 24, // 24 hours in seconds
     entrezBaseUrl: 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils',
@@ -27,6 +28,26 @@ const CONFIG = {
     trendingFile: path.join(__dirname, 'trending.json'),
     trendingUpdateInterval: 24 * 60 * 60 * 1000 // 24 hours
 };
+
+// Validate server codename (lowercase letters and numbers only, no spaces)
+const CODE_NAME_PATTERN = /^[a-z0-9]+$/;
+if (CONFIG.serverCodename && !CODE_NAME_PATTERN.test(CONFIG.serverCodename)) {
+    console.error(`
+╔═══════════════════════════════════════════════════════════╗
+║                     ERROR                                 ║
+╠═══════════════════════════════════════════════════════════╣
+║  Invalid SERVER_CODE_NAME: "${CONFIG.serverCodename}"     ║
+║                                                           ║
+║  Codename must contain only:                              ║
+║    - Lowercase letters (a-z)                             ║
+║    - Numbers (0-9)                                       ║
+║    - No spaces                                            ║
+║                                                           ║
+║  Example: export SERVER_CODE_NAME=entrezprod01            ║
+╚═══════════════════════════════════════════════════════════╝
+    `);
+    process.exit(1);
+}
 
 // Rate limiting
 const rateLimitStore = new Map();
@@ -164,6 +185,198 @@ class EntrezCache {
 const entrezCache = new EntrezCache();
 
 // API Keys storage (file-based, persisted)
+// ============================================================
+// Security: IP Tracking and Banning
+// ============================================================
+
+const BANNED_IPS_FILE = path.join(__dirname, 'banned_ips.json');
+
+// IP ban management
+class IpBanManager {
+    constructor() {
+        this.bannedIps = new Set(); // Direct IP bans
+        this.bannedSubnets = new Map(); // Subnet bans (e.g., /24)
+        this.ipViolationCounts = new Map(); // Track violations per IP
+        this.loadBannedIps();
+    }
+
+    loadBannedIps() {
+        try {
+            if (fs.existsSync(BANNED_IPS_FILE)) {
+                const data = JSON.parse(fs.readFileSync(BANNED_IPS_FILE, 'utf8'));
+                this.bannedIps = new Set(data.direct || []);
+                // Subnets stored as { "192.168.1": { count: 5, banned: true } }
+                this.bannedSubnets = new Map(Object.entries(data.subnets || {}));
+                console.log(`[SECURITY] Loaded ${this.bannedIps.size} banned IPs and ${this.bannedSubnets.size} banned subnets`);
+            }
+        } catch (e) {
+            console.log('[SECURITY] No banned IPs file, starting fresh');
+        }
+    }
+
+    saveBannedIps() {
+        try {
+            const data = {
+                direct: Array.from(this.bannedIps),
+                subnets: Object.fromEntries(this.bannedSubnets)
+            };
+            fs.writeFileSync(BANNED_IPS_FILE, JSON.stringify(data, null, 2));
+        } catch (e) {
+            console.error(`[SECURITY] Failed to save banned IPs: ${e.message}`);
+        }
+    }
+
+    // Check if IP is IPv4
+    isIpv4(ip) {
+        return ip.includes('.') && !ip.includes(':');
+    }
+
+    // Check if IP is IPv6
+    isIpv6(ip) {
+        return ip.includes(':');
+    }
+
+    // Get subnet from IP (IPv4: /24, IPv6: /48)
+    getSubnet(ip) {
+        if (this.isIpv4(ip)) {
+            const parts = ip.split('.');
+            if (parts.length === 4) {
+                return 'ipv4:' + parts.slice(0, 3).join('.'); // e.g., "ipv4:192.168.1"
+            }
+        } else if (this.isIpv6(ip)) {
+            // IPv6: use /48 subnet (first 3 hextets)
+            // Remove IPv6 prefix (::ffff: or leading zeros compression)
+            const normalized = ip.replace(/^::ffff:/, '').replace(/^::/, '');
+            const parts = normalized.split(':');
+            if (parts.length >= 3) {
+                return 'ipv6:' + parts.slice(0, 3).join(':'); // e.g., "ipv6:2001:db8:1"
+            }
+        }
+        return null;
+    }
+
+    // Check if IP is banned
+    isBanned(ip) {
+        if (this.bannedIps.has(ip)) return true;
+
+        // Check subnet
+        const subnet = this.getSubnet(ip);
+        if (subnet && this.bannedSubnets.has(subnet)) {
+            const subnetData = this.bannedSubnets.get(subnet);
+            if (subnetData.banned) return true;
+        }
+
+        return false;
+    }
+
+    // Record a violation for an IP
+    recordViolation(ip) {
+        const subnet = this.getSubnet(ip);
+
+        // Track individual IP violations
+        const count = (this.ipViolationCounts.get(ip) || 0) + 1;
+        this.ipViolationCounts.set(ip, count);
+
+        // If individual IP has 5+ violations, ban it
+        if (count >= 5) {
+            this.banIp(ip);
+            return;
+        }
+
+        // Track subnet violations
+        if (subnet) {
+            const subnetCount = (this.bannedSubnets.get(subnet)?.count || 0) + 1;
+            this.bannedSubnets.set(subnet, { count: subnetCount, banned: false });
+
+            // If /24 subnet has 10+ violations from different IPs, ban the subnet
+            if (subnetCount >= 10) {
+                this.banSubnet(subnet);
+            }
+        }
+    }
+
+    // Ban an IP
+    banIp(ip) {
+        if (!this.bannedIps.has(ip)) {
+            this.bannedIps.add(ip);
+            console.log(`[SECURITY] Banned IP: ${ip}`);
+            this.saveBannedIps();
+        }
+    }
+
+    // Ban a subnet (IPv4: /24, IPv6: /48)
+    banSubnet(subnet) {
+        const existing = this.bannedSubnets.get(subnet);
+        const subnetType = subnet.startsWith('ipv6') ? '/48' : '/24';
+        if (!existing || !existing.banned) {
+            this.bannedSubnets.set(subnet, { count: existing?.count || 0, banned: true });
+            console.log(`[SECURITY] Banned subnet: ${subnet}${subnetType}`);
+            this.saveBannedIps();
+        }
+    }
+
+    // Unban an IP
+    unbanIp(ip) {
+        if (this.bannedIps.delete(ip)) {
+            console.log(`[SECURITY] Unbanned IP: ${ip}`);
+            this.saveBannedIps();
+        }
+    }
+
+    // Unban a subnet
+    unbanSubnet(subnet) {
+        if (this.bannedSubnets.has(subnet)) {
+            this.bannedSubnets.delete(subnet);
+            const subnetType = subnet.startsWith('ipv6') ? '/48' : '/24';
+            console.log(`[SECURITY] Unbanned subnet: ${subnet}${subnetType}`);
+            this.saveBannedIps();
+        }
+    }
+
+    // Get banned IPs summary
+    getSummary() {
+        const subnetBans = Array.from(this.bannedSubnets.entries())
+            .filter(([_, v]) => v.banned)
+            .map(([k, v]) => {
+                const type = k.startsWith('ipv6') ? '/48' : '/24';
+                const subnet = k.replace(/^(ipv4:|ipv6:)/, '');
+                return `${subnet}${type}`;
+            });
+
+        // Separate IPv4 and IPv6 counts
+        const ipv4Bans = Array.from(this.bannedIps).filter(ip => this.isIpv4(ip));
+        const ipv6Bans = Array.from(this.bannedIps).filter(ip => this.isIpv6(ip));
+
+        return {
+            directBans: Array.from(this.bannedIps),
+            ipv4Bans: ipv4Bans,
+            ipv6Bans: ipv6Bans,
+            subnetBans: subnetBans,
+            violationCounts: Object.fromEntries(this.ipViolationCounts)
+        };
+    }
+
+    // Daily summary and cleanup
+    dailySummary() {
+        const summary = this.getSummary();
+        console.log('[SECURITY] Daily IP Security Summary:');
+        console.log(`  - Banned IPv4 IPs: ${summary.ipv4Bans.length}`);
+        console.log(`  - Banned IPv6 IPs: ${summary.ipv6Bans.length}`);
+        console.log(`  - Banned subnets: ${summary.subnetBans.length}`);
+
+        // Reset violation counts (start fresh each day)
+        this.ipViolationCounts.clear();
+
+        return summary;
+    }
+}
+
+const ipBanManager = new IpBanManager();
+
+// ============================================================
+// API Key Store with IP Tracking
+// ============================================================
+
 class ApiKeyStore {
     constructor() {
         this.keys = new Map();
@@ -284,6 +497,45 @@ class ApiKeyStore {
             return { success: true };
         }
         return { success: false, error: 'Invalid token' };
+    }
+
+    // Record registration IP
+    recordRegistrationIp(apiKey, ip) {
+        const pending = this.pending.get(apiKey);
+        if (pending) {
+            pending.registrationIp = ip;
+            this.savePending();
+        }
+    }
+
+    // Record API key usage IP
+    recordUsageIp(apiKey, ip) {
+        const entry = this.keys.get(apiKey);
+        if (entry) {
+            if (!entry.recentIps) {
+                entry.recentIps = [];
+            }
+            // Add to front, keep last 3
+            entry.recentIps = [ip, ...entry.recentIps.filter(i => i !== ip)].slice(0, 3);
+            this.save();
+        }
+    }
+
+    // Get API key info including recent IPs
+    getKeyInfo(apiKey) {
+        const entry = this.keys.get(apiKey);
+        if (entry) {
+            return {
+                contactName: entry.contactName,
+                websiteUrl: entry.websiteUrl,
+                email: entry.email,
+                toolId: entry.toolId,
+                recentIps: entry.recentIps || [],
+                createdOn: entry.createdOn,
+                activatedAt: entry.activatedAt
+            };
+        }
+        return null;
     }
 }
 
@@ -594,6 +846,12 @@ setInterval(updateTrendingData, CONFIG.trendingUpdateInterval);
 // Initial update after 5 seconds (to not block startup)
 setTimeout(updateTrendingData, 5000);
 
+// Daily security summary - run every 24 hours
+setInterval(() => {
+    const summary = ipBanManager.dailySummary();
+    console.log('[SECURITY] Daily IP summary:', summary);
+}, 24 * 60 * 60 * 1000);
+
 // Backup on uncaught exception
 process.on('uncaughtException', (err) => {
     console.error('\n[CRASH] Uncaught exception, saving backup...');
@@ -638,6 +896,13 @@ function filterParams(fnName, query) {
 
 // Check API key
 function checkApiKey(req, res, callback) {
+    const clientIp = req.socket.remoteAddress || req.connection.remoteAddress;
+
+    // Check if IP is banned
+    if (ipBanManager.isBanned(clientIp)) {
+        return sendJsonResponse(res, { error: 'Your IP has been banned' }, 403);
+    }
+
     const urlObj = new URL(req.url, `http://${req.headers.host}`);
     const query = Object.fromEntries(urlObj.searchParams);
     const apiKey = query.apikey;
@@ -648,8 +913,13 @@ function checkApiKey(req, res, callback) {
 
     const reg = apiKeyStore.get(apiKey);
     if (!reg) {
+        // Record violation for invalid API key attempt
+        ipBanManager.recordViolation(clientIp);
         return sendJsonResponse(res, { error: 'No API key matching the supplied value was found' }, 403);
     }
+
+    // Record this IP as used by the API key
+    apiKeyStore.recordUsageIp(apiKey, clientIp);
 
     req.entrezajax_developer_registration = reg;
     callback(query);
@@ -1080,6 +1350,13 @@ async function handleElinkAndEfetch(req, res, query) {
 
 // Register new developer
 function handleRegister(req, res) {
+    const clientIp = req.socket.remoteAddress || req.connection.remoteAddress;
+
+    // Check if IP is banned
+    if (ipBanManager.isBanned(clientIp)) {
+        return sendError(res, 'Your IP has been banned', 403);
+    }
+
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
@@ -1105,19 +1382,20 @@ function handleRegister(req, res) {
             const apiKey = crypto.createHash('md5').update(tool_id).digest('hex');
             const token = crypto.randomBytes(32).toString('hex');
 
-            // Store as pending (not verified yet)
+            // Store as pending (not verified yet) - include registration IP
             apiKeyStore.addPending(apiKey, {
                 contactName: contact_name,
                 websiteUrl: website_url,
                 email: email,
                 toolId: tool_id,
-                token: token
+                token: token,
+                registrationIp: clientIp
             });
 
             // Send verification email
             await sendVerificationEmail(email, tool_id, apiKey, token);
 
-            console.log(`[REGISTER] Pending registration: ${tool_id} -> ${apiKey}`);
+            console.log(`[REGISTER] Pending registration: ${tool_id} -> ${apiKey} from IP: ${clientIp}`);
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
@@ -1320,6 +1598,11 @@ async function handleRequest(req, res) {
                 }));
                 break;
 
+            case '/status/security':
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(ipBanManager.getSummary()));
+                break;
+
             case '/':
             case '/index.html':
             case '/developer.html':
@@ -1351,13 +1634,21 @@ server.listen(CONFIG.port, () => {
         ? `API key rotation: ${CONFIG.entrezApiKeys.length} keys`
         : 'API key rotation: disabled';
 
+    const codenameLine = CONFIG.serverCodename
+        ? `║  [${CONFIG.serverCodename}]                                         ║`
+        : '';
+
+    const titleLine = CONFIG.serverCodename
+        ? `║                   EntrezAJAX 2 JS Server [${CONFIG.serverCodename}]`
+        : `║                   EntrezAJAX 2 JS Server                    ║`;
+
     console.log(`
 ╔═══════════════════════════════════════════════════════════╗
-║                   EntrezAJAX 2 JS Server                    ║
+${titleLine}${' '.repeat(60 - titleLine.length)}║
 ║                       (EntrezJS)                          ║
-╠═══════════════════════════════════════════════════════════╣
+╠═══════════════════════════════════════════════════════════╗
 ║  Server running at http://localhost:${CONFIG.port}                  ║
-║                                                           ║
+${codenameLine}
 ║  Available endpoints:                                      ║
 ║    /espell          - Spelling suggestions                ║
 ║    /einfo           - Database information                ║
@@ -1375,12 +1666,15 @@ server.listen(CONFIG.port, () => {
 ║    /status/memcache - Cache/memory status                 ║
 ║    /status/trending - Daily trending data                  ║
 ║    /status/keys     - API key usage stats                 ║
+║    /status/security - IP ban status & violations          ║
 ║                                                           ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  SECURITY:                                                ║
 ║    - API key required for all main endpoints              ║
 ║    - Email verification required for new registrations    ║
 ║    - Rate limiting: 30 requests/minute per IP             ║
+║    - IP banning: 5+ violations = ban single IP           ║
+║    - Subnet banning: 10+ violations in /24 = ban subnet   ║
 ║    - Auto cleanup on high memory (>80%)                  ║
 ║    - Backups saved every 24h + on shutdown/crash          ║
 ║                                                           ║

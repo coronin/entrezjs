@@ -5,6 +5,9 @@ api_keys_pending.json
 
 trending.json
 
+# Security
+banned_ips.json
+
 # Node.js
 node_modules/
 npm-debug.log
