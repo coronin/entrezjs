@@ -17,6 +17,8 @@ entrezjs/
 ├── server.js            # Node.js server implementation (EntrezJS)
 ├── package.json         # NPM package configuration
 ├── test.js              # Test suite
+├── .env                 # Sensitive config (Queen: API keys, SMTP, webhook)
+├── .env.example         # Example config template
 ├── api_keys.json        # Registered API keys (runtime generated)
 ├── api_keys_pending.json # Pending email verifications
 ├── api_keys.backup.*.json # Backups with timestamps
@@ -53,15 +55,43 @@ The Node.js version (`server.js`) provides all the functionality of the original
 | **Security Headers** | XSS, frame protection enabled |
 | **Daily Trending** | Top 10 search terms + PMIDs, Slack webhook |
 | **Distributed Mode** | Queen/Bee architecture for multi-server |
+| **Encryption** | AES-256-GCM for Queen-Bee communication |
 
 ### Running the Node.js Server
 
 ```bash
-# Start server
+# Standalone/Bee mode (uses defaults)
 node server.js
+
+# Bee with custom port
+PORT=8081 node server.js
+
+# Bee connecting to queen
+PORT=8083 SERVER_CODE_NAME=bee02 SERVER_ROLE=bee QUEEN_HOST=192.168.1.100 QUEEN_PORT=8080 node server.js
+
+# Queen (requires unique codename)
+SERVER_CODE_NAME=queen01 SERVER_ROLE=queen node server.js
 
 # Run tests
 node test.js
+```
+
+### .env File (Queen only)
+
+Sensitive configuration for Queen servers:
+
+```bash
+# Copy example
+cp .env.example .env
+
+# Edit .env with your values
+SERVER_CODE_NAME=queen01
+SERVER_ROLE=queen
+ENTREZ_API_KEYS=key1,key2,key3
+SLACK_WEBHOOK_URL=https://hooks.slack.com/...
+SMTP_HOST=smtp.example.com
+SMTP_USER=user@example.com
+SMTP_PASSWORD=your-password
 ```
 
 ## Environment Variables
@@ -69,19 +99,21 @@ node test.js
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PORT` | Server port | 8080 |
-| `SERVER_CODE_NAME` | Server codename (a-z0-9, no spaces) | entrezjs1 |
+| `SERVER_CODE_NAME` | Server codename (a-z0-9, no spaces) | bee01 (standalone/bee) |
 | `SERVER_ROLE` | Role: `queen`, `bee`, or `standalone` | standalone |
 | `QUEEN_HOST` | Queen server IP (for bee) | - |
 | `QUEEN_PORT` | Queen server port (for bee) | 8080 |
 | `FIRST_QUEEN_HOST` | First queen IP (for second queen) | - |
 | `FIRST_QUEEN_PORT` | First queen port (for second queen) | 8080 |
 | `SERVER_URL` | Server URL for email verification | http://localhost:8080 |
-| `ENTREZ_API_KEYS` | Comma-separated API keys for rotation | - |
-| `SLACK_WEBHOOK_URL` | Slack webhook for daily trending | - |
-| `SMTP_HOST` | SMTP server for email | - |
+| `ENTREZ_API_KEYS` | Comma-separated API keys for rotation (Queen) | - |
+| `SLACK_WEBHOOK_URL` | Slack webhook for daily trending (Queen) | - |
+| `SMTP_HOST` | SMTP server for email (Queen) | - |
 | `SMTP_PORT` | SMTP port | 587 |
-| `SMTP_USER` | SMTP username | - |
-| `SMTP_PASS` | SMTP password | - |
+| `SMTP_USER` | SMTP username (Queen) | - |
+| `SMTP_PASS` | SMTP password (Queen) | - |
+
+**Note**: Queen role requires unique `SERVER_CODE_NAME`. Bee/Standalone can use default `bee01`.
 
 ## Distributed System (Queen/Bee)
 
@@ -106,7 +138,10 @@ node test.js
 ### Queen Configuration
 
 ```bash
-# Queen needs: codename, API keys, webhook
+# Queen requires unique codename + sensitive config via .env
+# Copy .env.example to .env and fill in values
+
+# Or use environment variables:
 export SERVER_ROLE=queen
 export SERVER_CODE_NAME=queen01
 export ENTREZ_API_KEYS="key1,key2,key3"
@@ -116,11 +151,14 @@ export SLACK_WEBHOOK_URL="https://hooks.slack.com/..."
 ### Bee Configuration
 
 ```bash
-# Bee needs: codename, queen address
+# Bee can use defaults (bee01)
+# Just specify queen address:
 export SERVER_ROLE=bee
-export SERVER_CODE_NAME=bee01
 export QUEEN_HOST=192.168.1.100
 export QUEEN_PORT=8080
+
+# Or run without any config:
+node server.js  # Uses bee01, standalone mode
 ```
 
 ### Second Queen (Failover)
@@ -143,10 +181,12 @@ On second queen join:
 | Endpoint | Description |
 |----------|-------------|
 | `/internal/register` | Bee registers with queen |
-| `/internal/sync` | Bee syncs API keys, blocked IPs |
+| `/internal/sync` | Bee syncs API keys, blocked IPs (encrypted) |
 | `/internal/status` | Bee status for queen collection |
-| `/internal/queen-update` | Broadcast new queen address |
-| `/internal/queen-handover` | First queen hands over to second |
+| `/internal/queen-update` | Broadcast new queen address (encrypted) |
+| `/internal/queen-handover` | First queen hands over to second (unencrypted) |
+
+**Note**: `/internal/sync` and `/internal/queen-update` use AES-256-GCM encryption with `SERVER_CODE_NAME` as the key. The initial `/internal/queen-handover` is unencrypted since the two queens have different codenames.
 
 ## Available Endpoints
 
@@ -190,7 +230,10 @@ Optimized dictionary format (not arrays):
 ## Configuration
 
 - **Cache Time**: 24 hours (default)
-- **Max Cache Entries**: 10,000
+- **Max Cache Entries**: 5,000
+- **Max Cache Size**: 512MB
+- **Compression**: GZIP for entries > 1KB
+- **Eviction**: LRU with size-based + entry-count limits
 - **Memory Threshold**: Auto cleanup at >80% heap usage
 - **Rate Limit**: 30 requests/minute per IP
 - **API Key Threshold**: Use keys when > 5 req/s
@@ -229,3 +272,4 @@ curl http://localhost:8080/status/security
 - Subnet banning (10+ violations in /24 or /48 = ban subnet)
 - Security headers (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection)
 - WHATWG URL API (no deprecated url.parse)
+- **Queen-Bee Encryption**: AES-256-GCM encryption for internal communication using `SERVER_CODE_NAME` as key

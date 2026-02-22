@@ -2,16 +2,37 @@
 
 const https = require('https');
 const http = require('http');
+const zlib = require('zlib');
 const url = require('url');
 const querystring = require('querystring');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+// ============================================================
+// Load .env file for sensitive configuration (QUEEN only)
+// ============================================================
+const envFile = path.join(__dirname, '.env');
+if (fs.existsSync(envFile)) {
+    const envContent = fs.readFileSync(envFile, 'utf8');
+    envContent.split('\n').forEach(line => {
+        const trimmed = line.trim();
+        if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
+            const [key, ...valueParts] = trimmed.split('=');
+            const value = valueParts.join('=').trim();
+            if (!process.env[key]) {
+                process.env[key] = value;
+            }
+        }
+    });
+    console.log('[CONFIG] Loaded .env file');
+}
+
 // Configuration
+// Default values for standalone/bee mode - easy to run multiple instances
 const CONFIG = {
     port: process.env.PORT || 8080,
-    serverCodename: process.env.SERVER_CODE_NAME || 'entrezjs1',
+    serverCodename: process.env.SERVER_CODE_NAME || 'bee01',  // Default bee01, queens must override
     email: 'n.j.loman@bham.ac.uk',
     cacheTime: 60 * 60 * 24, // 24 hours in seconds
     entrezBaseUrl: 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils',
@@ -53,22 +74,27 @@ const CONFIG = {
 };
 
 // Validate server codename (lowercase letters and numbers only, no spaces)
+// Queen role requires unique codename; bee/standalone can use default
 const CODE_NAME_PATTERN = /^[a-z0-9]+$/;
-if (CONFIG.serverCodename && !CODE_NAME_PATTERN.test(CONFIG.serverCodename)) {
-    console.error(`
-╔═══════════════════════════════════════════════════════════╗
-║                     ERROR                                 ║
-╠═══════════════════════════════════════════════════════════╣
-║  Invalid SERVER_CODE_NAME: "${CONFIG.serverCodename}"     ║
-║                                                           ║
-║  Codename must contain only:                              ║
-║    - Lowercase letters (a-z)                             ║
-║    - Numbers (0-9)                                       ║
-║    - No spaces                                            ║
-║                                                           ║
-║  Example: export SERVER_CODE_NAME=entrezprod01            ║
-╚═══════════════════════════════════════════════════════════╝
-    `);
+if (CONFIG.serverRole === 'queen' && (!CONFIG.serverCodename || CONFIG.serverCodename === 'bee01')) {
+    console.error('\n' +
+        'ERROR: QUEEN role requires a unique SERVER_CODE_NAME!\n\n' +
+        'Set via environment variable:\n' +
+        '  export SERVER_CODE_NAME=queen01\n' +
+        '  export SERVER_ROLE=queen\n\n' +
+        'Or create .env file:\n' +
+        '  SERVER_CODE_NAME=queen01\n' +
+        '  SERVER_ROLE=queen\n');
+    process.exit(1);
+}
+if (CONFIG.serverCodename && CONFIG.serverCodename !== 'bee01' && !CODE_NAME_PATTERN.test(CONFIG.serverCodename)) {
+    console.error('\n' +
+        'ERROR: Invalid SERVER_CODE_NAME: "' + CONFIG.serverCodename + '"\n\n' +
+        'Codename must contain only:\n' +
+        '  - Lowercase letters (a-z)\n' +
+        '  - Numbers (0-9)\n' +
+        '  - No spaces\n\n' +
+        'Example: export SERVER_CODE_NAME=queen01\n');
     process.exit(1);
 }
 
@@ -94,12 +120,15 @@ function checkRateLimit(ip) {
     return true;
 }
 
-// In-memory cache using node-cache
+// Optimized in-memory cache with compression and size-based eviction
 class EntrezCache {
     constructor() {
         this.cache = new Map();
-        this.maxSize = 10000; // Max number of cached entries
-        this.cleanupInterval = 60 * 60 * 1000; // Check every hour
+        this.maxEntries = 5000;  // Max number of cached entries
+        this.maxMemoryMB = 512;   // Max memory for cache (512MB)
+        this.currentSizeMB = 0;   // Current cache size estimate
+        this.cleanupInterval = 30 * 60 * 1000; // Check every 30 minutes
+        this.minCompressionSize = 1024; // Compress if > 1KB
 
         // Start periodic cleanup
         setInterval(() => this.cleanup(), this.cleanupInterval);
@@ -126,49 +155,125 @@ class EntrezCache {
         // Check memory and cleanup if needed
         this.checkMemory();
 
+        // Estimate size of data
+        const jsonStr = JSON.stringify(data);
+        const rawSize = Buffer.byteLength(jsonStr, 'utf8');
+
+        // Compress if large enough
+        let storedData = data;
+        let compressed = false;
+        let compressedSize = rawSize;
+
+        if (rawSize > this.minCompressionSize) {
+            try {
+                const compressedBuf = zlib.gzipSync(Buffer.from(jsonStr, 'utf8'));
+                compressedSize = compressedBuf.length;
+                // Only store compressed if it saves space
+                if (compressedSize < rawSize) {
+                    storedData = compressedBuf.toString('base64');
+                    compressed = true;
+                }
+            } catch (e) {
+                // Compression failed, store uncompressed
+            }
+        }
+
+        // Update total size
+        const entrySizeMB = compressedSize / (1024 * 1024);
+        this.currentSizeMB += entrySizeMB;
+
         this.cache.set(key, {
-            data: data,
+            data: storedData,
+            compressed: compressed,
+            rawSize: rawSize,
+            sizeMB: entrySizeMB,
             expires: Date.now() + (ttl * 1000),
             lastAccessed: Date.now()
         });
     }
 
+    // Get data (with decompression if needed)
+    get(key) {
+        const entry = this.cache.get(key);
+        if (!entry) return null;
+
+        if (entry.expires < Date.now()) {
+            this.currentSizeMB -= entry.sizeMB;
+            this.cache.delete(key);
+            return null;
+        }
+
+        // Update access time for LRU
+        entry.lastAccessed = Date.now();
+
+        // Decompress if needed
+        if (entry.compressed) {
+            try {
+                const buf = Buffer.from(entry.data, 'base64');
+                const decompressed = zlib.gunzipSync(buf);
+                return JSON.parse(decompressed.toString('utf8'));
+            } catch (e) {
+                return null;
+            }
+        }
+
+        return entry.data;
+    }
+
     getSize() {
-        return this.cache.size;
+        return {
+            entries: this.cache.size,
+            sizeMB: this.currentSizeMB.toFixed(2)
+        };
     }
 
     // Cleanup expired entries
     cleanup() {
         const now = Date.now();
         let removed = 0;
+        let freedMB = 0;
 
         for (const [key, entry] of this.cache) {
             if (entry.expires < now) {
+                freedMB += entry.sizeMB;
                 this.cache.delete(key);
                 removed++;
             }
         }
 
+        this.currentSizeMB -= freedMB;
+
         if (removed > 0) {
-            console.log(`[CACHE] Cleaned up ${removed} expired entries`);
+            console.log(`[CACHE] Cleaned up ${removed} expired entries (freed ${freedMB.toFixed(2)}MB)`);
         }
     }
 
     // Check memory usage and cleanup if needed
     checkMemory() {
-        // If cache is full, remove oldest entries (LRU)
-        if (this.cache.size >= this.maxSize) {
+        // If cache exceeds entry limit or memory limit, remove oldest entries (LRU)
+        const needsEviction = this.cache.size >= this.maxEntries || this.currentSizeMB >= this.maxMemoryMB;
+
+        if (needsEviction) {
             const entries = Array.from(this.cache.entries());
             // Sort by lastAccessed (oldest first)
             entries.sort((a, b) => a[1].lastAccessed - b[1].lastAccessed);
 
-            // Remove oldest 20%
-            const removeCount = Math.floor(this.maxSize * 0.2);
-            for (let i = 0; i < removeCount; i++) {
-                this.cache.delete(entries[i][0]);
+            // Remove oldest 20% or enough to get under 70% of limit
+            let targetCount = Math.floor(this.maxEntries * 0.2);
+            let targetMB = this.maxMemoryMB * 0.7;
+            let removed = 0;
+            let freedMB = 0;
+
+            for (let i = 0; i < entries.length && removed < targetCount; i++) {
+                if (this.currentSizeMB > targetMB || removed < targetCount) {
+                    freedMB += entries[i][1].sizeMB;
+                    this.cache.delete(entries[i][0]);
+                    removed++;
+                }
             }
 
-            console.log(`[CACHE] Evicted ${removeCount} oldest entries (cache full)`);
+            this.currentSizeMB -= freedMB;
+            console.log(`[CACHE] Evicted ${removed} entries (freed ${freedMB.toFixed(2)}MB)`);
         }
 
         // Check process memory
@@ -198,7 +303,9 @@ class EntrezCache {
         const used = process.memoryUsage();
         return {
             entries: this.cache.size,
-            maxSize: this.maxSize,
+            maxEntries: this.maxEntries,
+            sizeMB: this.currentSizeMB.toFixed(2),
+            maxSizeMB: this.maxMemoryMB,
             heapUsed: Math.round(used.heapUsed / 1024 / 1024) + 'MB',
             heapTotal: Math.round(used.heapTotal / 1024 / 1024) + 'MB'
         };
@@ -1759,8 +1866,42 @@ let currentQueen = {
     codename: null
 };
 
-// HTTP helper for inter-server communication
-function httpRequest(host, port, path, method = 'GET', data = null) {
+// ============================================================
+// Encryption for Queen-Bee communication using codename
+// ============================================================
+const ENCRYPTION_KEY = crypto.createHash('sha256').update(CONFIG.serverCodename).digest();
+
+function encryptData(data) {
+    if (!data) return null;
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
+    const encrypted = Buffer.concat([cipher.update(JSON.stringify(data), 'utf8'), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    return {
+        iv: iv.toString('base64'),
+        data: encrypted.toString('base64'),
+        tag: authTag.toString('base64')
+    };
+}
+
+function decryptData(encryptedObj) {
+    if (!encryptedObj) return null;
+    try {
+        const iv = Buffer.from(encryptedObj.iv, 'base64');
+        const encrypted = Buffer.from(encryptedObj.data, 'base64');
+        const authTag = Buffer.from(encryptedObj.tag, 'base64');
+        const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
+        decipher.setAuthTag(authTag);
+        const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+        return JSON.parse(decrypted.toString('utf8'));
+    } catch (e) {
+        console.error('[ENCRYPTION] Decryption failed:', e.message);
+        return null;
+    }
+}
+
+// HTTP helper for inter-server communication (with encryption)
+function httpRequest(host, port, path, method = 'GET', data = null, encrypt = true) {
     return new Promise((resolve, reject) => {
         const options = {
             hostname: host,
@@ -1773,21 +1914,38 @@ function httpRequest(host, port, path, method = 'GET', data = null) {
             }
         };
 
+        // Encrypt data if enabled and data exists
+        let payload = data;
+        if (encrypt && data && CONFIG.serverRole !== 'standalone') {
+            options.headers['X-Encrypted'] = 'true';
+            payload = encryptData(data);
+        }
+
         const req = http.request(options, (res) => {
             let responseData = '';
             res.on('data', chunk => responseData += chunk);
             res.on('end', () => {
-                try {
-                    resolve(JSON.parse(responseData));
-                } catch (e) {
-                    resolve(responseData);
+                // Check if response is encrypted
+                if (res.headers['x-encrypted'] === 'true') {
+                    try {
+                        const decrypted = decryptData(JSON.parse(responseData));
+                        resolve(decrypted);
+                    } catch (e) {
+                        reject(new Error('Failed to decrypt response'));
+                    }
+                } else {
+                    try {
+                        resolve(JSON.parse(responseData));
+                    } catch (e) {
+                        resolve(responseData);
+                    }
                 }
             });
         });
 
         req.on('error', reject);
-        if (data) {
-            req.write(JSON.stringify(data));
+        if (payload) {
+            req.write(JSON.stringify(payload));
         }
         req.end();
     });
@@ -1934,11 +2092,14 @@ async function handleQueenElection() {
     console.log(`[QUEEN] Joining as new queen, connecting to first queen at ${CONFIG.firstQueenHost}:${CONFIG.firstQueenPort}`);
 
     try {
-        // Get API keys from first queen
+        // Get API keys from first queen (no encryption for initial handshake)
         const firstQueenData = await httpRequest(
             CONFIG.firstQueenHost,
             CONFIG.firstQueenPort,
-            `/internal/queen-handover?newQueen=${CONFIG.serverCodename}`
+            `/internal/queen-handover?newQueen=${CONFIG.serverCodename}`,
+            'GET',
+            null,
+            false  // No encryption for initial handover
         );
 
         if (firstQueenData.apiKeys) {
@@ -2030,7 +2191,12 @@ function handleInternalRequest(req, res, pathname, query) {
         req.on('data', chunk => body += chunk);
         req.on('end', async () => {
             try {
-                const data = JSON.parse(body);
+                let data;
+                if (req.headers['x-encrypted'] === 'true') {
+                    data = decryptData(JSON.parse(body));
+                } else {
+                    data = JSON.parse(body);
+                }
                 const beeCodename = query.bee;
 
                 // Update bee last seen
@@ -2060,19 +2226,18 @@ function handleInternalRequest(req, res, pathname, query) {
                 apiKeyStore.save();
                 ipBanManager.saveBannedIps();
 
-                // Return consolidated data
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-
                 // Get all API keys and blocked IPs to share
                 const allApiKeys = [];
                 for (const [key, value] of apiKeyStore.keys) {
                     allApiKeys.push({ key, email: value.email, toolId: value.toolId });
                 }
 
-                res.end(JSON.stringify({
+                const responseData = {
                     apiKeys: allApiKeys,
                     blockedIps: Array.from(ipBanManager.bannedIps)
-                }));
+                };
+                res.writeHead(200, { 'Content-Type': 'application/json', 'X-Encrypted': 'true' });
+                res.end(JSON.stringify(encryptData(responseData)));
             } catch (e) {
                 res.writeHead(500);
                 res.end(JSON.stringify({ error: e.message }));
@@ -2118,12 +2283,17 @@ function handleInternalRequest(req, res, pathname, query) {
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
             try {
-                const data = JSON.parse(body);
+                let data;
+                if (req.headers['x-encrypted'] === 'true') {
+                    data = decryptData(JSON.parse(body));
+                } else {
+                    data = JSON.parse(body);
+                }
                 currentQueen.host = data.host;
                 currentQueen.port = data.port;
                 console.log(`[BEE] Queen updated to ${data.host}:${data.port}`);
-                res.writeHead(200);
-                res.end(JSON.stringify({ success: true }));
+                res.writeHead(200, { 'X-Encrypted': 'true' });
+                res.end(JSON.stringify(encryptData({ success: true })));
             } catch (e) {
                 res.writeHead(500);
                 res.end(JSON.stringify({ error: e.message }));
