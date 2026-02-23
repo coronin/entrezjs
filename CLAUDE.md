@@ -44,7 +44,8 @@ The Node.js version (`server.js`) provides all the functionality of the original
 
 | Feature | Description |
 |---------|-------------|
-| **Caching** | 24-hour in-memory cache with LRU eviction |
+| **Zero Dependencies** | No npm install required - uses only Node.js built-in modules |
+| **Caching** | 24-hour in-memory cache with GZIP compression |
 | **Memory Management** | Auto cleanup when memory > 80% |
 | **Email Verification** | Registration requires email verification |
 | **API Key Rotation** | Adaptive - only use keys when > 5 req/s |
@@ -56,6 +57,14 @@ The Node.js version (`server.js`) provides all the functionality of the original
 | **Daily Trending** | Top 10 search terms + PMIDs, Slack webhook |
 | **Distributed Mode** | Queen/Bee architecture for multi-server |
 | **Encryption** | AES-256-GCM for Queen-Bee communication |
+| **SSRF Protection** | Blocks private/internal IPs on bee registration |
+
+### Quick Start (No npm install required!)
+
+```bash
+# Just copy the files and run - no dependencies needed!
+node server.js
+```
 
 ### Running the Node.js Server
 
@@ -273,3 +282,4 @@ curl http://localhost:8080/status/security
 - Security headers (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection)
 - WHATWG URL API (no deprecated url.parse)
 - **Queen-Bee Encryption**: AES-256-GCM encryption for internal communication using `SERVER_CODE_NAME` as key
+- **SSRF Protection**: Blocks private/internal IPs (IPv4/IPv6/NAT64) on bee registration

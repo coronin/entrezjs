@@ -1900,8 +1900,89 @@ function decryptData(encryptedObj) {
     }
 }
 
-// HTTP helper for inter-server communication (with encryption)
+
+// ============================================================
+// SSRF Protection - Block private/internal IPs
+// ============================================================
+const PRIVATE_IP_RANGES = [
+    // IPv4 private ranges
+    /^10\./,                           // 10.0.0.0/8
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./, // 172.16.0.0/12
+    /^192\.168\./,                      // 192.168.0.0/16
+    /^127\./,                           // 127.0.0.0/8 (loopback)
+    /^169\.254\./,                      // 169.254.0.0/16 (link-local)
+    /^0\./,                             // 0.0.0.0/8
+    /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./, // 100.64.0.0/10 (CGN)
+    /^224\./,                           // 224.0.0.0/4 (multicast)
+    /^240\./,                           // 240.0.0.0/4 (reserved)
+    // IPv6 private ranges
+    /^::1$/,                            // localhost
+    /^fe80:/i,                          // fe80::/10 (link-local)
+    /^fc/i,                             // fc00::/7 (unique local)
+    /^fd/i,                             // fd00::/8 (unique local)
+    /^2001:db8:/i,                      // 2001:db8::/32 (documentation)
+    /^64:ff9b::/i,                      // 64:ff9b::/96 (NAT64)
+    /^100::/i,                          // 100::/64 (ancer)
+    /^::ffff:(127|169\.254|10|172\.(1[6-9]|2[0-9]|3[0-1])|192\.168)\./i, // IPv4-mapped IPv6
+];
+
+function isPrivateIP(hostname) {
+    // Check if it's an IP address
+    const ipv4Regex = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+    const ipv6Regex = /^([0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}$/i;
+
+    // Check IPv4
+    const ipv4Match = hostname.match(ipv4Regex);
+    if (ipv4Match) {
+        const ip = hostname;
+        for (const range of PRIVATE_IP_RANGES) {
+            if (range.test(ip)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Check IPv6
+    const ipv6Match = hostname.match(ipv6Regex);
+    if (ipv6Match || hostname.includes(':')) {
+        // Normalize IPv6 (expand ::)
+        let normalized = hostname.toLowerCase();
+        if (normalized === '::1') return true;
+        if (normalized.startsWith('::ffff:')) {
+            // IPv4-mapped IPv6 - check the IPv4 part
+            const ipv4Part = normalized.substring(7);
+            return isPrivateIP(ipv4Part);
+        }
+        for (const range of PRIVATE_IP_RANGES) {
+            if (range.test(normalized)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Not an IP address - might be a hostname, resolve it
+    return null; // Need DNS resolution to determine
+}
+
+// Validate host for SSRF protection
+function validateHost(hostname) {
+    const isPrivate = isPrivateIP(hostname);
+    if (isPrivate === true) {
+        return { valid: false, error: 'Private IP not allowed' };
+    }
+    return { valid: true };
+}
+
+// HTTP helper for inter-server communication (with encryption and SSRF protection)
 function httpRequest(host, port, path, method = 'GET', data = null, encrypt = true) {
+    // SSRF Protection: validate target host
+    const validation = validateHost(host);
+    if (!validation.valid) {
+        return Promise.reject(new Error(`[SSRF] Blocked: ${validation.error} - ${host}`));
+    }
+
     return new Promise((resolve, reject) => {
         const options = {
             hostname: host,
@@ -2179,7 +2260,18 @@ function handleInternalRequest(req, res, pathname, query) {
         const codename = query.bee;
         const host = query.host;
         const port = query.port || CONFIG.port;
+
+        // SSRF Protection: validate the host before registering
+        const validation = validateHost(host);
+        if (!validation.valid) {
+            console.error(`[SSRF] Blocked bee registration from private IP: ${host}`);
+            res.writeHead(403);
+            res.end(JSON.stringify({ error: 'Private IP not allowed' }));
+            return;
+        }
+
         beeRegistry.register(codename, host, port);
+        console.log(`[BEE] Registered: ${codename} from ${host}:${port}`);
         res.writeHead(200);
         res.end(JSON.stringify({ success: true }));
         return;
