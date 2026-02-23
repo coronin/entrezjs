@@ -42,9 +42,18 @@ const SERVER_ROLE = process.env.SERVER_ROLE || 'standalone';
 // Required for standalone/queen, optional for bee (default: bee01)
 const SERVER_CODE_NAME = process.env.SERVER_CODE_NAME || 'bee01';
 
+// Used for HTTPS certificate path and email from address
+const DOMAIN_SUFFIX = process.env.DOMAIN_SUFFIX || 'cccc.cn';
+
 // QUEEN ADDRESS (for bee mode only)
 const QUEEN_HOST = process.env.QUEEN_HOST || '';      // e.g., '192.168.1.100'
 const QUEEN_PORT = process.env.QUEEN_PORT || '8080';
+const QUEEN_HTTPS = process.env.QUEEN_HTTPS === 'true' || process.env.QUEEN_HTTPS === '1';  // Set to 'true' if queen uses HTTPS
+
+// First queen address (for second queen joining)
+const FIRST_QUEEN_HOST = process.env.FIRST_QUEEN_HOST || '';
+const FIRST_QUEEN_PORT = process.env.FIRST_QUEEN_PORT || '8080';
+const FIRST_QUEEN_HTTPS = process.env.FIRST_QUEEN_HTTPS === 'true' || process.env.FIRST_QUEEN_HTTPS === '1';
 
 // ============================================================
 
@@ -62,9 +71,9 @@ const CONFIG = {
     // ============================================================
     // HTTPS/TLS Configuration (certbot)
     // ============================================================
-    // Default domain: {codename}.cccc.cn
+    // Default domain: {codename}.{suffix}
     defaultDomain: SERVER_CODE_NAME && SERVER_CODE_NAME !== 'bee01'
-        ? `${SERVER_CODE_NAME}.cccc.cn`
+        ? `${SERVER_CODE_NAME}.${DOMAIN_SUFFIX}`
         : '',
     certPath: process.env.CERT_PATH || '/etc/letsencrypt/live',
     keyFile: process.env.KEY_FILE || 'privkey.pem',
@@ -72,12 +81,13 @@ const CONFIG = {
 
     // Server URL - auto-generated from domain if not set
     serverUrl: process.env.SERVER_URL || (SERVER_CODE_NAME && SERVER_CODE_NAME !== 'bee01'
-        ? `https://${SERVER_CODE_NAME}.cccc.cn:${process.env.PORT || 8080}`
-        : 'https://localhost:8080'),
+        ? `https://${SERVER_CODE_NAME}.${DOMAIN_SUFFIX}:${process.env.PORT || 8080}`
+        : `https://localhost:${process.env.PORT || 8080}`),
     smtpHost: process.env.SMTP_HOST || '',
     smtpPort: process.env.SMTP_PORT || 587,
     smtpUser: process.env.SMTP_USER || '',
     smtpPass: process.env.SMTP_PASS || '',
+    smtpFrom: process.env.SMTP_FROM || '',  // Sender email address (e.g., noreply@yourdomain.com)
     // Multiple API keys for rotation (for higher rate limits)
     entrezApiKeys: (process.env.ENTREZ_API_KEYS || '').split(',').filter(k => k.trim()),
     trendingFile: path.join(__dirname, 'trending.json'),
@@ -91,10 +101,12 @@ const CONFIG = {
     // Queen server address (for bee to connect)
     queenHost: QUEEN_HOST,
     queenPort: QUEEN_PORT,
+    queenHttps: QUEEN_HTTPS,
 
     // For second queen joining (optional)
-    firstQueenHost: process.env.FIRST_QUEEN_HOST || '',
-    firstQueenPort: process.env.FIRST_QUEEN_PORT || '8080',
+    firstQueenHost: FIRST_QUEEN_HOST,
+    firstQueenPort: FIRST_QUEEN_PORT,
+    firstQueenHttps: FIRST_QUEEN_HTTPS,
 
     // Sync interval (1 hour)
     syncInterval: 60 * 60 * 1000,
@@ -741,11 +753,59 @@ Best regards,
 EntrezJS Team
     `.trim();
 
-    // If SMTP is configured, send real email
+    // Bee mode: sync to queen for email sending (queen handles SMTP)
+    if (CONFIG.serverRole === 'bee' && CONFIG.queenHost) {
+        console.log(`[EMAIL] Bee mode: pending registration synced to queen for email sending`);
+        return true;
+    }
+
+    // If SMTP is configured, send real email (queen/standalone only)
     if (CONFIG.smtpHost && CONFIG.smtpUser && CONFIG.smtpPass) {
-        // Use nodemailer or similar - for now, log to console
-        console.log(`[EMAIL] Would send verification email to ${email}`);
-        console.log(`[EMAIL] Verify URL: ${verifyUrl}`);
+
+        // Dynamic require - only load nodemailer when needed (queen/standalone)
+        let nodemailer;
+        try {
+            nodemailer = require('nodemailer');
+        } catch (e) {
+            console.log('[EMAIL] nodemailer not installed, skipping email send');
+            console.log(`[EMAIL] Verify URL: ${verifyUrl}`);
+            return true;
+        }
+
+        // create reusable transporter object using SMTP transport
+        let transporter = nodemailer.createTransport({
+            host: CONFIG.smtpHost,
+            port: CONFIG.smtpPort,
+            auth: {
+                user: CONFIG.smtpUser,
+                pass: CONFIG.smtpPass
+            }
+        })
+        let recp_tos = [ email ] // list of receivers
+        // setup e-mail data with unicode symbols
+        // Use configured SMTP_FROM or fallback to smtpUser@domain
+        const fromAddress = CONFIG.smtpFrom || (CONFIG.smtpUser + '@' + (CONFIG.defaultDomain || 'sendcloud.net'));
+        let mailOptions = {
+            from: fromAddress,
+            to: recp_tos.join(', '),
+            subject: 'From EntrezJS',
+            text: emailContent,
+            attachments: [
+                {
+                    filename: 'from-entrezjs.txt',
+                    content: emailContent
+                }
+            ]
+        }
+        transporter.sendMail(mailOptions, function(error, info){
+            if(error){
+                console.log(error);
+                console.log(CONFIG.serverUrl + '/verify?key=' + apiKey + '&token=' + token);
+                return false;
+            }
+            console.log('[SMTP] ' + info.response);
+        });
+
     } else {
         // Log to console for development
         console.log(`[EMAIL] Verification email (dev mode):`);
@@ -1398,7 +1458,7 @@ function paginate(query, idList) {
 
 // Send JSON response with optional JSONP
 function sendJsonResponse(res, data, statusCode = 200, query = {}) {
-    const result = { entrezajax: { error: false }, ...data };
+    const result = { entrezjs: { error: false }, ...data };
     const callback = query.callback;
     let body;
 
@@ -1416,7 +1476,7 @@ function sendJsonResponse(res, data, statusCode = 200, query = {}) {
 
 // Send error response
 function sendError(res, message, statusCode = 500) {
-    const result = { entrezajax: { error: true, message: message } };
+    const result = { entrezjs: { error: true, message: message } };
     res.writeHead(statusCode, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result));
 }
@@ -1475,7 +1535,7 @@ async function handleEsearchAndEsummary(req, res, query) {
     const summaryResult = await executeAndCache('esummary', reg, summaryParams);
     sendJsonResponse(res, {
         result: summaryResult,
-        entrezajax: { error: false }
+        entrezjs: { error: false }
     }, 200, query);
 }
 
@@ -1726,7 +1786,8 @@ function handleRegister(req, res) {
                         'POST',
                         `/internal/sync-pending?bee=${CONFIG.serverCodename}`,
                         JSON.stringify(syncData),
-                        { 'Content-Type': 'application/json' }
+                        { 'Content-Type': 'application/json' },
+                        CONFIG.queenHttps
                     );
                     console.log(`[REGISTER] Synced pending registration to queen for ${tool_id}`);
                 } catch (e) {
@@ -1837,7 +1898,8 @@ async function handleVerify(req, res, query) {
                         'POST',
                         `/internal/sync?bee=${CONFIG.serverCodename}`,
                         JSON.stringify(syncData),
-                        { 'Content-Type': 'application/json' }
+                        { 'Content-Type': 'application/json' },
+                        CONFIG.queenHttps
                     );
                     console.log(`[VERIFY] Synced verified key to queen: ${keyData.toolId}`);
                 } catch (e) {
@@ -2248,8 +2310,8 @@ function validateHost(hostname) {
     return { valid: true };
 }
 
-// HTTP helper for inter-server communication (with encryption and SSRF protection)
-function httpRequest(host, port, path, method = 'GET', data = null, encrypt = true) {
+// HTTP/HTTPS helper for inter-server communication (with encryption and SSRF protection)
+function httpRequest(host, port, path, method = 'GET', data = null, encrypt = true, useHttps = false) {
     // SSRF Protection: validate target host
     const validation = validateHost(host);
     if (!validation.valid) {
@@ -2264,7 +2326,7 @@ function httpRequest(host, port, path, method = 'GET', data = null, encrypt = tr
             method: method,
             headers: {
                 'Content-Type': 'application/json',
-                'User-Agent': 'EntrezJS/2.0-Distributed'
+                'User-Agent': 'EntrezJS/3.0-Distributed'
             }
         };
 
@@ -2275,7 +2337,10 @@ function httpRequest(host, port, path, method = 'GET', data = null, encrypt = tr
             payload = encryptData(data);
         }
 
-        const req = http.request(options, (res) => {
+        // Use https or http based on useHttps parameter
+        const client = useHttps ? https : http;
+
+        const req = client.request(options, (res) => {
             let responseData = '';
             res.on('data', chunk => responseData += chunk);
             res.on('end', () => {
@@ -2350,7 +2415,9 @@ async function syncToQueen() {
                 blockedIps: myBlockedIps,
                 cacheMeta: cacheMeta,
                 timestamp: Date.now()
-            }
+            },
+            true,
+            CONFIG.queenHttps
         );
 
         console.log(`[SYNC] Sync result:`, result);
@@ -2453,7 +2520,8 @@ async function handleQueenElection() {
             `/internal/queen-handover?newQueen=${CONFIG.serverCodename}`,
             'GET',
             null,
-            false  // No encryption for initial handover
+            false,  // No encryption for initial handover
+            CONFIG.firstQueenHttps
         );
 
         if (firstQueenData.apiKeys) {
@@ -2747,14 +2815,21 @@ const certDomainDir = path.join(certBaseDir, CONFIG.defaultDomain);
 const keyFilePath = path.join(certDomainDir, CONFIG.keyFile);
 const certFilePath = path.join(certDomainDir, CONFIG.certFile);
 
-if (CONFIG.defaultDomain && fs.existsSync(keyFilePath) && fs.existsSync(certFilePath)) {
+const httpsEnabled = CONFIG.defaultDomain && fs.existsSync(keyFilePath) && fs.existsSync(certFilePath);
+
+if (httpsEnabled) {
     const httpsOptions = {
         key: fs.readFileSync(keyFilePath),
         cert: fs.readFileSync(certFilePath)
     };
+
+    // Create HTTPS server
     server = https.createServer(httpsOptions, handleRequest);
     protocol = 'https';
     console.log(`[HTTPS] Using certificates from ${certDomainDir}`);
+
+    // Note: HTTP->HTTPS redirect should be handled by reverse proxy (nginx/caddy)
+    // or use iptables/port 80 redirect. Don't bind both HTTP and HTTPS on same port.
 } else {
     server = http.createServer(handleRequest);
     if (CONFIG.defaultDomain) {

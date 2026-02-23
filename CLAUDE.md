@@ -19,18 +19,18 @@ Published in: Loman, N. and M. Pallen (2010). "EntrezJS: direct web browser acce
 
 ```
 entrezjs/
-├─server.js               # Node.js server implementation (EntrezJS)
-├── package.json         # NPM package configuration
-├─test.js                 # Test suite
-├─.env                    # Sensitive config (Queen: API keys, SMTP, webhook)
-├─.env.example            # Example config template
-├─api_keys.json           # Registered API keys (runtime generated)
-├─api_keys_pending.json   # Pending email verifications
-├─api_keys.backup.*.json  # Backups with timestamps
-├─trending.json           # Daily trending data
-├─bees.json               # Registered bee servers (queen only)
-├─shared_cache.json       # Shared cache metadata
-└─banned_ips.json         # Blocked IPs
+├ ─server.js               # Node.js server implementation (EntrezJS)
+├ package.json            # NPM package configuration
+├ ─test.js                 # Test suite
+├ ─.env                    # Sensitive config (Queen: API keys, SMTP, webhook)
+├ ─.env.example            # Example config template
+├ ─api_keys.json           # Registered API keys (runtime generated)
+├ ─api_keys_pending.json   # Pending email verifications
+├ ─api_keys.backup.*.json  # Backups with timestamps
+├ ─trending.json           # Daily trending data
+├ ─bees.json               # Registered bee servers (queen only)
+├ ─shared_cache.json       # Shared cache metadata
+└ ─banned_ips.json         # Blocked IPs
 ```
 
 ## Node.js Implementation (EntrezJS)
@@ -97,7 +97,7 @@ ENTREZ_API_KEYS=key1,key2,key3
 SLACK_WEBHOOK_URL=https://hooks.slack.com/...
 SMTP_HOST=smtp.example.com
 SMTP_USER=user@example.com
-SMTP_PASSWORD=your-password
+SMTP_PASS=your-password
 ```
 
 ## Environment Variables
