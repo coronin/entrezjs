@@ -1,8 +1,11 @@
 {
   "name": "entrezjs",
-  "version": "2.0.0",
-  "description": "EntrezAJAX 2 JS (EntrezJS) - NCBI Entrez API proxy with JSON/JSONP and caching",
+  "version": "3.0.1",
+  "description": "EntrezJS - NCBI Entrez API proxy with JSON/JSONP and caching",
   "main": "server.js",
+  "engines": {
+    "node": ">=16"
+  },
   "scripts": {
     "start": "node server.js",
     "test": "node test.js"

@@ -28,18 +28,52 @@ if (fs.existsSync(envFile)) {
     console.log('[CONFIG] Loaded .env file');
 }
 
+// ============================================================
+// MANUAL CONFIGURATION - Change these to switch modes
+// ============================================================
+
+// MODE: 'standalone', 'bee', or 'queen'
+// - standalone: Single server, handles registration + API
+// - bee: Connects to queen, syncs data
+// - queen: Central server, manages bees, sends emails
+const SERVER_ROLE = process.env.SERVER_ROLE || 'standalone';
+
+// CODENAME: Unique name for this server (a-z0-9, no spaces)
+// Required for standalone/queen, optional for bee (default: bee01)
+const SERVER_CODE_NAME = process.env.SERVER_CODE_NAME || 'bee01';
+
+// QUEEN ADDRESS (for bee mode only)
+const QUEEN_HOST = process.env.QUEEN_HOST || '';      // e.g., '192.168.1.100'
+const QUEEN_PORT = process.env.QUEEN_PORT || '8080';
+
+// ============================================================
+
 // Configuration
-// Default values for standalone/bee mode - easy to run multiple instances
 const CONFIG = {
     port: process.env.PORT || 8080,
-    serverCodename: process.env.SERVER_CODE_NAME || 'bee01',  // Default bee01, queens must override
+    serverCodename: SERVER_CODE_NAME,
     email: 'n.j.loman@bham.ac.uk',
     cacheTime: 60 * 60 * 24, // 24 hours in seconds
     entrezBaseUrl: 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils',
     apiKeysFile: path.join(__dirname, 'api_keys.json'),
     apiKeysBackupFile: path.join(__dirname, 'api_keys.backup.json'),
     backupInterval: 24 * 60 * 60 * 1000, // 24 hours in milliseconds
-    serverUrl: process.env.SERVER_URL || 'http://localhost:8080',
+
+    // ============================================================
+    // HTTPS/TLS Configuration (certbot)
+    // ============================================================
+    // Default domain: {codename}.cccc.cn
+    defaultDomain: SERVER_CODE_NAME && SERVER_CODE_NAME !== 'bee01'
+        ? `${SERVER_CODE_NAME}.cccc.cn`
+        : '',
+    certPath: process.env.CERT_PATH || '/etc/letsencrypt/live',
+    keyFile: process.env.KEY_FILE || 'privkey.pem',
+    certFile: process.env.CERT_FILE || 'fullchain.pem',
+
+    // Server URL - auto-generated from domain if not set
+    serverUrl: process.env.SERVER_URL || (SERVER_CODE_NAME && SERVER_CODE_NAME !== 'bee01'
+        ? `https://${SERVER_CODE_NAME}.cccc.cn:${process.env.PORT || 8080}`
+        : 'https://localhost:8080'),
     smtpHost: process.env.SMTP_HOST || '',
     smtpPort: process.env.SMTP_PORT || 587,
     smtpUser: process.env.SMTP_USER || '',
@@ -52,12 +86,11 @@ const CONFIG = {
     // ============================================================
     // Distributed System Configuration (Queen/Bee)
     // ============================================================
-    // Role: 'queen' or 'bee' (default: standalone mode, no sync)
-    serverRole: process.env.SERVER_ROLE || 'standalone',
+    serverRole: SERVER_ROLE,
 
     // Queen server address (for bee to connect)
-    queenHost: process.env.QUEEN_HOST || '',
-    queenPort: process.env.QUEEN_PORT || '8080',
+    queenHost: QUEEN_HOST,
+    queenPort: QUEEN_PORT,
 
     // For second queen joining (optional)
     firstQueenHost: process.env.FIRST_QUEEN_HOST || '',
@@ -74,17 +107,23 @@ const CONFIG = {
 };
 
 // Validate server codename (lowercase letters and numbers only, no spaces)
-// Queen role requires unique codename; bee/standalone can use default
+// Queen/standalone role requires unique codename; bee can use default
 const CODE_NAME_PATTERN = /^[a-z0-9]+$/;
-if (CONFIG.serverRole === 'queen' && (!CONFIG.serverCodename || CONFIG.serverCodename === 'bee01')) {
+if ((SERVER_ROLE === 'queen' || SERVER_ROLE === 'standalone') && (!SERVER_CODE_NAME || SERVER_CODE_NAME === 'bee01')) {
     console.error('\n' +
-        'ERROR: QUEEN role requires a unique SERVER_CODE_NAME!\n\n' +
-        'Set via environment variable:\n' +
-        '  export SERVER_CODE_NAME=queen01\n' +
-        '  export SERVER_ROLE=queen\n\n' +
-        'Or create .env file:\n' +
-        '  SERVER_CODE_NAME=queen01\n' +
-        '  SERVER_ROLE=queen\n');
+        `ERROR: ${SERVER_ROLE.toUpperCase()} mode requires a unique SERVER_CODE_NAME!\n\n` +
+        '=== QUICK START ===\n' +
+        'To run as BEE (connect to queen):\n' +
+        '  export SERVER_ROLE=bee\n' +
+        '  export QUEEN_HOST=192.168.1.100\n' +
+        '  export QUEEN_PORT=8080\n\n' +
+        'To run as QUEEN (central server):\n' +
+        '  export SERVER_ROLE=queen\n' +
+        '  export SERVER_CODE_NAME=queen01\n\n' +
+        'To run as STANDALONE (single server):\n' +
+        '  export SERVER_ROLE=standalone\n' +
+        '  export SERVER_CODE_NAME=myserver01\n\n' +
+        'Or create .env file with above settings.\n');
     process.exit(1);
 }
 if (CONFIG.serverCodename && CONFIG.serverCodename !== 'bee01' && !CODE_NAME_PATTERN.test(CONFIG.serverCodename)) {
@@ -729,21 +768,25 @@ function backupApiKeys() {
     }
 }
 
-// Schedule periodic backup (every 24 hours)
-setInterval(backupApiKeys, CONFIG.backupInterval);
+// Schedule periodic backup (Queen only, every 24 hours)
+if (CONFIG.serverRole === 'queen') {
+    setInterval(backupApiKeys, CONFIG.backupInterval);
+}
 
-// Backup on normal shutdown
-process.on('SIGINT', () => {
-    console.log('\n[SHUTDOWN] Saving backup before exit...');
-    backupApiKeys();
-    process.exit(0);
-});
+// Backup on normal shutdown (Queen only)
+if (CONFIG.serverRole === 'queen') {
+    process.on('SIGINT', () => {
+        console.log('\n[SHUTDOWN] Saving backup before exit...');
+        backupApiKeys();
+        process.exit(0);
+    });
 
-process.on('SIGTERM', () => {
-    console.log('\n[SHUTDOWN] Saving backup before exit...');
-    backupApiKeys();
-    process.exit(0);
-});
+    process.on('SIGTERM', () => {
+        console.log('\n[SHUTDOWN] Saving backup before exit...');
+        backupApiKeys();
+        process.exit(0);
+    });
+}
 
 // ============================================================
 // Daily Trending Data Collection
@@ -864,11 +907,17 @@ async function fetchTopPmids() {
     }
 }
 
-// Post to Slack webhook
+// Post to Slack webhook (Queen only)
 async function postToSlack() {
     const webhookUrl = process.env.SLACK_WEBHOOK_URL;
     if (!webhookUrl) {
-        console.log('[SLACK] No webhook URL configured');
+        return;
+    }
+
+    // Check if there's data to post
+    if ((!trendingData.topSearchTerms || trendingData.topSearchTerms.length === 0) &&
+        (!trendingData.topPmids || trendingData.topPmids.length === 0)) {
+        console.log('[SLACK] No trending data to post');
         return;
     }
 
@@ -969,18 +1018,20 @@ async function updateTrendingData() {
     }
 }
 
-// Schedule trending data update
-loadTrendingData();
-setInterval(updateTrendingData, CONFIG.trendingUpdateInterval);
+// Schedule trending data update (Queen only)
+if (CONFIG.serverRole === 'queen') {
+    loadTrendingData();
+    setInterval(updateTrendingData, CONFIG.trendingUpdateInterval);
 
-// Initial update after 5 seconds (to not block startup)
-setTimeout(updateTrendingData, 5000);
+    // Initial update after 5 seconds (to not block startup)
+    setTimeout(updateTrendingData, 5000);
 
-// Daily security summary - run every 24 hours
-setInterval(() => {
-    const summary = ipBanManager.dailySummary();
-    console.log('[SECURITY] Daily IP summary:', summary);
-}, 24 * 60 * 60 * 1000);
+    // Daily security summary - run every 24 hours
+    setInterval(() => {
+        const summary = ipBanManager.dailySummary();
+        console.log('[SECURITY] Daily IP summary:', summary);
+    }, 24 * 60 * 60 * 1000);
+}
 
 // Backup on uncaught exception
 process.on('uncaughtException', (err) => {
@@ -1515,15 +1566,109 @@ async function handleElinkAndEfetch(req, res, query) {
     sendJsonResponse(res, { result: fetchResult, count: idListLen }, 200, query);
 }
 
-// Register new developer
+// Register new developer - shows HTML form
 function handleRegister(req, res) {
     const clientIp = req.socket.remoteAddress || req.connection.remoteAddress;
+    const method = req.method;
 
     // Check if IP is banned
     if (ipBanManager.isBanned(clientIp)) {
         return sendError(res, 'Your IP has been banned', 403);
     }
 
+    // GET request - show registration form
+    if (method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Register - EntrezJS</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; line-height: 1.6; }
+        h1 { color: #333; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        button { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #0056b3; }
+        .note { background: #f8f9fa; padding: 15px; border-radius: 4px; margin-top: 20px; }
+        .examples { background: #f0f0f0; padding: 20px; border-radius: 4px; margin-top: 30px; }
+        code { background: #e9ecef; padding: 2px 6px; border-radius: 3px; }
+        pre { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 4px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>EntrezJS Registration</h1>
+    <p>Register to get an API key for accessing NCBI Entrez databases.</p>
+
+    <form method="POST" action="/register">
+        <div class="form-group">
+            <label for="tool_id">Tool ID *</label>
+            <input type="text" id="tool_id" name="tool_id" placeholder="e.g., myapp, mywebsite" required>
+            <small>A unique identifier for your application</small>
+        </div>
+
+        <div class="form-group">
+            <label for="contact_name">Contact Name *</label>
+            <input type="text" id="contact_name" name="contact_name" placeholder="Your name" required>
+        </div>
+
+        <div class="form-group">
+            <label for="email">Email Address *</label>
+            <input type="email" id="email" name="email" placeholder="your@email.com" required>
+            <small>Verification link will be sent to this email</small>
+        </div>
+
+        <div class="form-group">
+            <label for="website_url">Website URL *</label>
+            <input type="url" id="website_url" name="website_url" placeholder="https://example.com" required>
+        </div>
+
+        <button type="submit">Register</button>
+    </form>
+
+    <div class="note">
+        <strong>Note:</strong> After registration, you will receive a verification email. Click the link in the email to activate your API key.
+    </div>
+
+    <div class="examples">
+        <h2>Usage Examples</h2>
+
+        <h3>1. esearch + esummary (Combined)</h3>
+        <p>Search PubMed and get summaries in a single request:</p>
+        <pre>/esearch+esummary?apikey=YOUR_API_KEY&db=pubmed&term=cancer</pre>
+
+        <h3>2. esearch + efetch (Combined)</h3>
+        <p>Search and fetch full records:</p>
+        <pre>/esearch+efetch?apikey=YOUR_API_KEY&db=pubmed&term=cancer&rettype=abstract&retmode=text</pre>
+
+        <h3>3. Separate Requests</h3>
+        <p>Step 1 - Search:</p>
+        <pre>/esearch?apikey=YOUR_API_KEY&db=pubmed&term=cancer&retmax=5</pre>
+        <p>Step 2 - Get summaries:</p>
+        <pre>/esummary?apikey=YOUR_API_KEY&db=pubmed&id=38354089,38354088</pre>
+        <p>Step 3 - Fetch details:</p>
+        <pre>/efetch?apikey=YOUR_API_KEY&db=pubmed&id=38354089&rettype=abstract&retmode=text</pre>
+
+        <h3>4. Other Databases</h3>
+        <p>Protein:</p>
+        <pre>/esearch+esummary?apikey=YOUR_API_KEY&db=protein&term=BRCA1&retmax=3</pre>
+        <p>Nucleotide:</p>
+        <pre>/esearch+efetch?apikey=YOUR_API_KEY&db=nucleotide&term=BRCA1&rettype=fasta&retmode=text</pre>
+
+        <h3>5. JSONP Callback</h3>
+        <pre>/esearch+esummary?apikey=YOUR_API_KEY&db=pubmed&term=cancer&callback=myCallback</pre>
+    </div>
+</body>
+</html>
+        `);
+        return;
+    }
+
+    // POST request - process form submission
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
@@ -1559,18 +1704,101 @@ function handleRegister(req, res) {
                 registrationIp: clientIp
             });
 
-            // Send verification email
-            await sendVerificationEmail(email, tool_id, apiKey, token);
+            // Send verification email (queen/standalone sends directly, bee syncs to queen)
+            if (CONFIG.serverRole === 'bee' && currentQueen.host) {
+                // Bee: sync pending registration to queen, queen will send email
+                try {
+                    const syncData = {
+                        pendingRegistrations: [{
+                            apiKey: apiKey,
+                            toolId: tool_id,
+                            email: email,
+                            contactName: contact_name,
+                            websiteUrl: website_url,
+                            token: token,
+                            registrationIp: clientIp
+                        }]
+                    };
+
+                    await httpRequest(
+                        currentQueen.host,
+                        currentQueen.port,
+                        'POST',
+                        `/internal/sync-pending?bee=${CONFIG.serverCodename}`,
+                        JSON.stringify(syncData),
+                        { 'Content-Type': 'application/json' }
+                    );
+                    console.log(`[REGISTER] Synced pending registration to queen for ${tool_id}`);
+                } catch (e) {
+                    console.error(`[REGISTER] Failed to sync to queen: ${e.message}`);
+                }
+            } else {
+                // Queen/standalone: send verification email directly
+                await sendVerificationEmail(email, tool_id, apiKey, token);
+            }
 
             console.log(`[REGISTER] Pending registration: ${tool_id} -> ${apiKey} from IP: ${clientIp}`);
 
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                success: true,
-                message: 'Registration successful. Please check your email to verify your account.',
-                apiKey: apiKey,
-                pending: true
-            }));
+            // Return success HTML page
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Registration Successful - EntrezJS</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; line-height: 1.6; }
+        h1 { color: #28a745; }
+        .success-box { background: #d4edda; border: 1px solid #c3e6cb; padding: 20px; border-radius: 4px; margin: 20px 0; }
+        .warning-box { background: #fff3cd; border: 1px solid #ffeeba; padding: 15px; border-radius: 4px; margin: 20px 0; }
+        .examples { background: #f0f0f0; padding: 20px; border-radius: 4px; margin-top: 30px; }
+        code { background: #e9ecef; padding: 2px 6px; border-radius: 3px; }
+        pre { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 4px; overflow-x: auto; }
+        a { color: #007bff; }
+    </style>
+</head>
+<body>
+    <h1>Registration Successful!</h1>
+
+    <div class="success-box">
+        <strong>API Key (pending):</strong> <code>${apiKey}</code>
+    </div>
+
+    <div class="warning-box">
+        <strong>Please check your email!</strong>
+        <p>A verification link has been sent to <strong>${email}</strong>.</p>
+        <p>Click the link in the email to activate your API key. The link will expire in 24 hours.</p>
+    </div>
+
+    <h2>What to do next</h2>
+    <ol>
+        <li>Check your email inbox (and spam folder) for the verification message</li>
+        <li>Click the verification link</li>
+        <li>Once verified, use your API key to access the Entrez API</li>
+    </ol>
+
+    <div class="examples">
+        <h2>Quick Start Examples</h2>
+
+        <h3>1. esearch + esummary (Combined)</h3>
+        <p>Search PubMed and get summaries in one request:</p>
+        <pre>/esearch+esummary?apikey=${apiKey}&db=pubmed&term=cancer</pre>
+
+        <h3>2. esearch + efetch (Combined)</h3>
+        <p>Search and fetch full records:</p>
+        <pre>/esearch+efetch?apikey=${apiKey}&db=pubmed&term=cancer&rettype=abstract&retmode=text</pre>
+
+        <h3>3. JSONP Callback</h3>
+        <pre>/esearch+esummary?apikey=${apiKey}&db=pubmed&term=cancer&callback=myCallback</pre>
+
+        <h3>4. More Examples</h3>
+        <p>See more examples at: <a href="/register">/register</a></p>
+    </div>
+</body>
+</html>
+            `);
         } catch (e) {
             sendError(res, e.message, 500);
         }
@@ -1578,7 +1806,7 @@ function handleRegister(req, res) {
 }
 
 // Verify email
-function handleVerify(req, res, query) {
+async function handleVerify(req, res, query) {
     const apiKey = query.key;
     const token = query.token;
 
@@ -1590,6 +1818,34 @@ function handleVerify(req, res, query) {
 
     if (result.success) {
         console.log(`[VERIFY] API key verified: ${apiKey}`);
+
+        // If bee, sync verified key to queen
+        if (CONFIG.serverRole === 'bee' && currentQueen.host) {
+            const keyData = apiKeyStore.keys.get(apiKey);
+            if (keyData) {
+                try {
+                    const syncData = {
+                        apiKeys: [{
+                            key: apiKey,
+                            toolId: keyData.toolId,
+                            email: keyData.email
+                        }]
+                    };
+                    await httpRequest(
+                        currentQueen.host,
+                        currentQueen.port,
+                        'POST',
+                        `/internal/sync?bee=${CONFIG.serverCodename}`,
+                        JSON.stringify(syncData),
+                        { 'Content-Type': 'application/json' }
+                    );
+                    console.log(`[VERIFY] Synced verified key to queen: ${keyData.toolId}`);
+                } catch (e) {
+                    console.error(`[VERIFY] Failed to sync to queen: ${e.message}`);
+                }
+            }
+        }
+
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(`
 <!DOCTYPE html>
@@ -1744,10 +2000,12 @@ async function handleRequest(req, res) {
                 break;
 
             case '/register':
+                // All roles can handle registration (queen, standalone, bee)
                 handleRegister(req, res);
                 break;
 
             case '/verify':
+                // All roles can handle verification
                 handleVerify(req, res, query);
                 break;
 
@@ -1758,11 +2016,21 @@ async function handleRequest(req, res) {
                 break;
 
             case '/status/trending':
+                if (CONFIG.serverRole !== 'queen' && CONFIG.serverRole !== 'standalone') {
+                    res.writeHead(503);
+                    res.end(JSON.stringify({ error: 'Trending only available on Queen server' }));
+                    return;
+                }
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify(trendingData, null, 2));
                 break;
 
             case '/status/keys':
+                if (CONFIG.serverRole !== 'queen' && CONFIG.serverRole !== 'standalone') {
+                    res.writeHead(503);
+                    res.end(JSON.stringify({ error: 'API key status only available on Queen server' }));
+                    return;
+                }
                 // Only show API key usage stats (not the actual keys)
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
@@ -1775,6 +2043,11 @@ async function handleRequest(req, res) {
                 break;
 
             case '/status/security':
+                if (CONFIG.serverRole !== 'queen' && CONFIG.serverRole !== 'standalone') {
+                    res.writeHead(503);
+                    res.end(JSON.stringify({ error: 'Security status only available on Queen server' }));
+                    return;
+                }
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify(ipBanManager.getSummary()));
                 break;
@@ -2118,9 +2391,9 @@ async function syncFromQueen() {
     // This is called by queen to pull data from bees
 }
 
-// Queen collects data from all bees
+// Queen/standalone collects data from all bees
 async function collectFromBees() {
-    if (CONFIG.serverRole !== 'queen') return;
+    if (CONFIG.serverRole !== 'queen' && CONFIG.serverRole !== 'standalone') return;
 
     console.log('[QUEEN] Collecting data from bees...');
 
@@ -2338,6 +2611,54 @@ function handleInternalRequest(req, res, pathname, query) {
         return;
     }
 
+    // Bee syncs pending registrations to queen (queen sends verification email)
+    if (path.startsWith('/internal/sync-pending') && (CONFIG.serverRole === 'queen' || CONFIG.serverRole === 'standalone')) {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', async () => {
+            try {
+                let data;
+                if (req.headers['x-encrypted'] === 'true') {
+                    data = decryptData(JSON.parse(body));
+                } else {
+                    data = JSON.parse(body);
+                }
+                const beeCodename = query.bee;
+
+                console.log(`[SYNC] Received pending registrations from bee: ${beeCodename}`);
+
+                // Process pending registrations
+                if (data.pendingRegistrations) {
+                    for (const pending of data.pendingRegistrations) {
+                        // Store locally
+                        if (!apiKeyStore.toolIdExists(pending.toolId)) {
+                            apiKeyStore.addPending(pending.apiKey, {
+                                contactName: pending.contactName,
+                                websiteUrl: pending.websiteUrl,
+                                email: pending.email,
+                                toolId: pending.toolId,
+                                token: pending.token,
+                                registrationIp: pending.registrationIp
+                            });
+
+                            // Send verification email
+                            await sendVerificationEmail(pending.email, pending.toolId, pending.apiKey, pending.token);
+                            console.log(`[SYNC] Stored pending registration from bee and sent verification email: ${pending.toolId}`);
+                        }
+                    }
+                }
+
+                res.writeHead(200);
+                res.end(JSON.stringify({ success: true }));
+            } catch (e) {
+                console.error(`[SYNC] Failed to process pending registrations: ${e.message}`);
+                res.writeHead(500);
+                res.end(JSON.stringify({ error: e.message }));
+            }
+        });
+        return;
+    }
+
     // Queen handover to new queen
     if (path === '/internal/queen-handover' && CONFIG.serverRole === 'queen') {
         const newQueen = query.newQueen;
@@ -2416,8 +2737,30 @@ function handleInternalRequest(req, res, pathname, query) {
     res.end('Not Found');
 }
 
-// Create and start server
-const server = http.createServer(handleRequest);
+// Create and start server (HTTP or HTTPS)
+let server;
+let protocol = 'http';
+
+// Check for certbot certificates
+const certBaseDir = CONFIG.certPath;
+const certDomainDir = path.join(certBaseDir, CONFIG.defaultDomain);
+const keyFilePath = path.join(certDomainDir, CONFIG.keyFile);
+const certFilePath = path.join(certDomainDir, CONFIG.certFile);
+
+if (CONFIG.defaultDomain && fs.existsSync(keyFilePath) && fs.existsSync(certFilePath)) {
+    const httpsOptions = {
+        key: fs.readFileSync(keyFilePath),
+        cert: fs.readFileSync(certFilePath)
+    };
+    server = https.createServer(httpsOptions, handleRequest);
+    protocol = 'https';
+    console.log(`[HTTPS] Using certificates from ${certDomainDir}`);
+} else {
+    server = http.createServer(handleRequest);
+    if (CONFIG.defaultDomain) {
+        console.log(`[HTTP] No certificates found at ${certDomainDir}, using HTTP`);
+    }
+}
 
 server.listen(CONFIG.port, () => {
     const apiKeyInfo = CONFIG.entrezApiKeys.length > 0
@@ -2429,23 +2772,30 @@ server.listen(CONFIG.port, () => {
         : '';
 
     const titleLine = CONFIG.serverCodename
-        ? `║                   EntrezAJAX 2 JS Server [${CONFIG.serverCodename}]`
-        : `║                   EntrezAJAX 2 JS Server                    ║`;
+        ? `║                   EntrezJS Server [${CONFIG.serverCodename}]`
+        : `║                   EntrezJS Server                          ║`;
 
     // Role display
     let roleInfo = '';
     if (CONFIG.serverRole === 'queen') {
         roleInfo = `║  Role: QUEEN (backup, trending, IP blocking)             ║`;
+    } else if (CONFIG.serverRole === 'standalone') {
+        roleInfo = `║  Role: STANDALONE (backup, trending, IP blocking)        ║`;
     } else if (CONFIG.serverRole === 'bee') {
         roleInfo = `║  Role: BEE -> queen: ${CONFIG.queenHost}:${CONFIG.queenPort}           ║`;
     }
+
+    // Server URL for display
+    const serverUrl = CONFIG.defaultDomain
+        ? `${protocol}://${CONFIG.defaultDomain}:${CONFIG.port}`
+        : `${protocol}://localhost:${CONFIG.port}`;
 
     console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ${titleLine}${' '.repeat(60 - titleLine.length)}║
 ║                       (EntrezJS)                          ║
 ╠═══════════════════════════════════════════════════════════╗
-║  Server running at http://localhost:${CONFIG.port}                  ║
+║  Server running at ${serverUrl.padEnd(53)}║
 ${codenameLine}
 ${roleInfo}
 ║  Available endpoints:                                      ║
@@ -2482,8 +2832,7 @@ ${roleInfo}
 ║    - Auto cleanup on high memory (>80%)                  ║
 ║    - Backups saved every 24h + on shutdown/crash          ║
 ║                                                           ║
-║  ${apiKeyInfo.padEnd(59)}║
-║    - Slack webhook: ${process.env.SLACK_WEBHOOK_URL ? 'enabled' : 'disabled'.padEnd(36)}║
+${(CONFIG.serverRole === 'queen' || CONFIG.serverRole === 'standalone') ? `║  ${apiKeyInfo.padEnd(59)}║\n║    - Slack webhook: ${process.env.SLACK_WEBHOOK_URL ? 'enabled' : 'disabled'.padEnd(36)}║\n║    - SMTP: ${CONFIG.smtpHost ? 'configured' : 'not configured'.padEnd(45)}║` : ''}
 ║  Cache time: ${CONFIG.cacheTime} seconds (${CONFIG.cacheTime / 3600} hours)              ║
 ╚═══════════════════════════════════════════════════════════╝
     `);

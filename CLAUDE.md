@@ -1,39 +1,36 @@
-# EntrezAJAX 2 JS (EntrezJS)
+# EntrezJS
+
+## Version History
+
+| Version | Status | Description |
+|---------|--------|-------------|
+| 2.0.0 | EntrezAJAX | Original Python version on Google App Engine |
+| 3.0.1 | EntrezJS | Node.js rewrite in production |
+
+## About
 
 A bioinformatics web service that provides JSON/AJAX endpoints for NCBI's Entrez Programming Utilities (E-utilities). The original Python version was hosted on Google App Engine. This Node.js version provides the same functionality with easier deployment.
 
 Allows web browsers to directly access NCBI's Entrez databases (PubMed, GenBank, Protein, Nucleotide, etc.) via AJAX without being blocked by the Same-Origin Policy. Supports JSONP for cross-origin requests.
 
-Published in: Loman, N. and M. Pallen (2010). "EntrezAJAX: direct web browser access to the Entrez Programming Utilities." *Source Code for Biology and Medicine* 5(1): 6.
+Published in: Loman, N. and M. Pallen (2010). "EntrezJS: direct web browser access to the Entrez Programming Utilities." *Source Code for Biology and Medicine* 5(1): 6.
 
 ## Project Structure
 
 ```
 entrezjs/
-├── main.py              # Original Python WSGI entry point (GAE)
-├── settings.py          # Django settings (GAE-specific)
-├── urls.py              # URL routing configuration
-├── app.yaml             # Google App Engine configuration
-├── server.js            # Node.js server implementation (EntrezJS)
+├─server.js               # Node.js server implementation (EntrezJS)
 ├── package.json         # NPM package configuration
-├── test.js              # Test suite
-├── .env                 # Sensitive config (Queen: API keys, SMTP, webhook)
-├── .env.example         # Example config template
-├── api_keys.json        # Registered API keys (runtime generated)
-├── api_keys_pending.json # Pending email verifications
-├── api_keys.backup.*.json # Backups with timestamps
-├── trending.json        # Daily trending data
-├── bees.json           # Registered bee servers (queen only)
-├── shared_cache.json    # Shared cache metadata
-├── banned_ips.json     # Blocked IPs
-├── Bio/                 # Biopython library (Entrez module)
-├── json_endpoint/       # Core API endpoint module (Python)
-├── devdb/               # Developer registration module
-├── hmmer/               # HMMER protein domain search module
-├── infopages/           # Info pages and examples
-├── templates/           # HTML templates
-├── static/              # Static files
-└── appengine_django/    # Django-Google App Engine adapter
+├─test.js                 # Test suite
+├─.env                    # Sensitive config (Queen: API keys, SMTP, webhook)
+├─.env.example            # Example config template
+├─api_keys.json           # Registered API keys (runtime generated)
+├─api_keys_pending.json   # Pending email verifications
+├─api_keys.backup.*.json  # Backups with timestamps
+├─trending.json           # Daily trending data
+├─bees.json               # Registered bee servers (queen only)
+├─shared_cache.json       # Shared cache metadata
+└─banned_ips.json         # Blocked IPs
 ```
 
 ## Node.js Implementation (EntrezJS)
@@ -114,7 +111,7 @@ SMTP_PASSWORD=your-password
 | `QUEEN_PORT` | Queen server port (for bee) | 8080 |
 | `FIRST_QUEEN_HOST` | First queen IP (for second queen) | - |
 | `FIRST_QUEEN_PORT` | First queen port (for second queen) | 8080 |
-| `SERVER_URL` | Server URL for email verification | http://localhost:8080 |
+| `SERVER_URL` | Server URL for email verification | https://localhost:8080 |
 | `ENTREZ_API_KEYS` | Comma-separated API keys for rotation (Queen) | - |
 | `SLACK_WEBHOOK_URL` | Slack webhook for daily trending (Queen) | - |
 | `SMTP_HOST` | SMTP server for email (Queen) | - |
@@ -253,23 +250,23 @@ Optimized dictionary format (not arrays):
 
 ```bash
 # 1. Register to get API key
-curl -X POST http://localhost:8080/register \
-  -d "contact_name=Test&website_url=http://example.com&email=test@example.com&tool_id=mytool"
+curl -X POST https://localhost:8080/register \
+  -d "contact_name=Test&website_url=https://example.com&email=test@example.com&tool_id=mytool"
 
 # 2. Check email for verification link
 # Click the /verify?key=xxx&token=xxx link
 
 # 3. Use the API
-curl "http://localhost:8080/esearch?apikey=YOUR_API_KEY&db=pubmed&term=cancer"
+curl "https://localhost:8080/esearch?apikey=YOUR_API_KEY&db=pubmed&term=cancer"
 
 # 4. JSONP callback
-curl "http://localhost:8080/esearch?apikey=YOUR_API_KEY&db=pubterm=cancer&callback=myFunc"
+curl "https://localhost:8080/esearch?apikey=YOUR_API_KEY&db=pubterm=cancer&callback=myFunc"
 
 # 5. Check status
-curl http://localhost:8080/status/memcache
-curl http://localhost:8080/status/trending
-curl http://localhost:8080/status/keys
-curl http://localhost:8080/status/security
+curl https://localhost:8080/status/memcache
+curl https://localhost:8080/status/trending
+curl https://localhost:8080/status/keys
+curl https://localhost:8080/status/security
 ```
 
 ## Security
