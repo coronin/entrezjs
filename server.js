@@ -1350,7 +1350,8 @@ function parseXmlToJson(xml) {
     if (summaryMatch) {
         const inner = summaryMatch[1];
         const docsumMatches = inner.match(/<DocSum>[\s\S]*?<\/DocSum>/g) || [];
-        const results = {};
+        // Return array (like Python), not dict
+        const results = [];
         for (const docsum of docsumMatches) {
             const id = extractXmlValue(docsum, 'Id');
             const items = {};
@@ -1358,15 +1359,44 @@ function parseXmlToJson(xml) {
             for (const item of itemMatches) {
                 const nameMatch = item.match(/Name="([^"]+)"/);
                 const typeMatch = item.match(/Type="([^"]+)"/);
-                const valueMatch = item.match(/>([^<]+)<\/Item>/);
-                if (nameMatch && valueMatch) {
-                    items[nameMatch[1]] = {
-                        Type: typeMatch ? typeMatch[1] : 'String',
-                        Content: valueMatch[1]
-                    };
+                if (nameMatch && typeMatch) {
+                    const itemName = nameMatch[1];
+                    const itemType = typeMatch[1];
+                    let content;
+
+                    if (itemType === 'List') {
+                        // For List type, extract all nested Item values
+                        const nestedItems = item.match(/<Item Name="[^"]*"[^>]*>([^<]*)<\/Item>/g) || [];
+                        const listValues = [];
+                        for (const nested of nestedItems) {
+                            const nestedMatch = nested.match(/<Item Name="[^"]*"[^>]*>([^<]*)<\/Item>/);
+                            if (nestedMatch) {
+                                listValues.push(nestedMatch[1]);
+                            }
+                        }
+                        content = listValues.length > 0 ? listValues : null;
+                    } else {
+                        // For other types, extract the text content
+                        const valueMatch = item.match(/>([^<]*)<\/Item>/);
+                        content = valueMatch ? valueMatch[1] : null;
+
+                        // Convert Integer to number
+                        if (itemType === 'Integer' && content !== null) {
+                            content = parseInt(content, 10);
+                        }
+                    }
+
+                    if (content !== null) {
+                        items[itemName] = {
+                            Type: itemType,
+                            Content: content
+                        };
+                    }
                 }
             }
-            results[id] = items;
+            // Add Id to the item (as Integer)
+            items['Id'] = { Type: 'Integer', Content: parseInt(id, 10) };
+            results.push(items);
         }
         return results;
     }
@@ -1377,28 +1407,30 @@ function parseXmlToJson(xml) {
         const inner = elinkMatch[1];
         const linkSetDbMatch = inner.match(/<LinkSetDb>([\s\S]*?)<\/LinkSetDb>/g);
         if (linkSetDbMatch) {
-            const linkSetDbs = {};
+            // Return array format (like Python)
+            const linkSetDbs = [];
             for (const lsdb of linkSetDbMatch) {
                 const dbTo = extractXmlValue(lsdb, 'DbTo');
                 const links = extractXmlValues(lsdb, 'Id');
                 if (dbTo) {
-                    linkSetDbs[dbTo] = links;
+                    linkSetDbs.push({ [dbTo]: links });
                 }
             }
-            if (Object.keys(linkSetDbs).length > 0) {
+            if (linkSetDbs.length > 0) {
                 return linkSetDbs;
             }
         }
         // Check for LinkSet
         const linkSetMatch = inner.match(/<LinkSet>([\s\S]*?)<\/LinkSet>/g);
         if (linkSetMatch) {
-            const results = {};
+            // Return array format (like Python)
+            const results = [];
             for (const ls of linkSetMatch) {
                 const dbFrom = extractXmlValue(ls, 'DbFrom');
                 const dbTo = extractXmlValue(ls, 'DbTo');
                 const links = extractXmlValues(ls, 'Id');
                 if (dbFrom && dbTo) {
-                    results[`${dbFrom}_to_${dbTo}`] = links;
+                    results.push({ [dbTo]: links });
                 }
             }
             return results;
@@ -1502,16 +1534,27 @@ function paginate(query, idList) {
 }
 
 // Send JSON response with optional JSONP
+// Format matches Python EntrezAJAX:
+// - Without callback: just records (e.g., {result: ..., count: ...})
+// - With callback: { entrezjs: {count: N}, error: false, result: {result: ...} }
 function sendJsonResponse(res, data, statusCode = 200, query = {}) {
-    const result = { entrezjs: { error: false }, ...data };
     const callback = query.callback;
     let body;
 
     if (callback) {
-        body = `${callback}(${JSON.stringify(result)})`;
+        // JSONP format (matches Python)
+        // Extract extradict (like count) from data, rest goes to result
+        const { result, ...extradict } = data;
+        const jsonpResult = {
+            entrezjs: extradict,  // e.g., {count: 10}
+            error: false,
+            result: data            // full data including result
+        };
+        body = `${callback}(${JSON.stringify(jsonpResult)})`;
         res.setHeader('Content-Type', 'application/javascript');
     } else {
-        body = JSON.stringify(result);
+        // Regular JSON: just return records (no wrapper)
+        body = JSON.stringify(data);
         res.setHeader('Content-Type', 'application/json');
     }
 
@@ -1521,7 +1564,8 @@ function sendJsonResponse(res, data, statusCode = 200, query = {}) {
 
 // Send error response
 function sendError(res, message, statusCode = 500) {
-    const result = { entrezjs: { error: true, message: message } };
+    // Error format matches Python
+    const result = { error: true, message: message };
     res.writeHead(statusCode, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result));
 }

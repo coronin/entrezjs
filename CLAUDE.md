@@ -224,11 +224,11 @@ On second queen join:
 
 ## JSON Output Format
 
-Optimized dictionary format (not arrays):
+Matches Python EntrezAJAX format:
 
 ```javascript
-// esummary: { "12345": { "Title": "...", "Authors": "..." } }
-// elink: { "pubmed": ["123", "456"], "protein": ["789"] }
+// esummary: [{ "Id": "12345", "Title": "...", "Authors": "..." }, ...]
+// elink: [{ "pubmed": ["123", "456"] }, { "protein": ["789"] }]
 // einfo: { "DbList": [...], "DbInfo": { "pubmed": {...} } }
 // espell: { "pubmed": "cancer" }
 ```
