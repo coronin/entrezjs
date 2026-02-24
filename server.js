@@ -118,6 +118,12 @@ const CONFIG = {
     sharedCacheFile: path.join(__dirname, 'shared_cache.json')
 };
 
+// ============================================================
+// Encryption for Queen-Bee communication
+// ============================================================
+// Shared encryption key for Queen-Bee communication
+const ENCRYPTION_KEY = crypto.createHash('sha256').update('QueenBee').digest();
+
 // Validate server codename (lowercase letters and numbers only, no spaces)
 // Queen/standalone role requires unique codename; bee can use default
 const CODE_NAME_PATTERN = /^[a-z0-9]+$/;
@@ -784,7 +790,7 @@ EntrezJS Team
         let recp_tos = [ email ] // list of receivers
         // setup e-mail data with unicode symbols
         // Use configured SMTP_FROM or fallback to smtpUser@domain
-        const fromAddress = CONFIG.smtpFrom || (CONFIG.smtpUser + '@' + (CONFIG.defaultDomain || 'sendcloud.net'));
+        const fromAddress = CONFIG.smtpFrom || CONFIG.smtpUser;
         let mailOptions = {
             from: fromAddress,
             to: recp_tos.join(', '),
@@ -800,7 +806,7 @@ EntrezJS Team
         transporter.sendMail(mailOptions, function(error, info){
             if(error){
                 console.log(error);
-                console.log(CONFIG.serverUrl + '/verify?key=' + apiKey + '&token=' + token);
+                console.log(CONFIG.serverUrl + '/verify?key=' + apiKey + '&token=' + token); // LC
                 return false;
             }
             console.log('[SMTP] ' + info.response);
@@ -1786,12 +1792,13 @@ function handleRegister(req, res) {
                         'POST',
                         `/internal/sync-pending?bee=${CONFIG.serverCodename}`,
                         JSON.stringify(syncData),
-                        { 'Content-Type': 'application/json' },
+                        true,
                         CONFIG.queenHttps
                     );
                     console.log(`[REGISTER] Synced pending registration to queen for ${tool_id}`);
                 } catch (e) {
                     console.error(`[REGISTER] Failed to sync to queen: ${e.message}`);
+                    console.log(CONFIG.serverUrl + '/verify?key=' + apiKey + '&token=' + token); // LC
                 }
             } else {
                 // Queen/standalone: send verification email directly
@@ -1898,7 +1905,7 @@ async function handleVerify(req, res, query) {
                         'POST',
                         `/internal/sync?bee=${CONFIG.serverCodename}`,
                         JSON.stringify(syncData),
-                        { 'Content-Type': 'application/json' },
+                        true,
                         CONFIG.queenHttps
                     );
                     console.log(`[VERIFY] Synced verified key to queen: ${keyData.toolId}`);
@@ -2201,11 +2208,6 @@ let currentQueen = {
     codename: null
 };
 
-// ============================================================
-// Encryption for Queen-Bee communication using codename
-// ============================================================
-const ENCRYPTION_KEY = crypto.createHash('sha256').update(CONFIG.serverCodename).digest();
-
 function encryptData(data) {
     if (!data) return null;
     const iv = crypto.randomBytes(12);
@@ -2330,7 +2332,8 @@ function httpRequest(host, port, path, method = 'GET', data = null, encrypt = tr
             }
         };
 
-        // Encrypt data if enabled and data exists
+        // Encrypt data if enabled and data exists (standalone doesn't encrypt)
+        // Queen and Bee both use shared key for encryption
         let payload = data;
         if (encrypt && data && CONFIG.serverRole !== 'standalone') {
             options.headers['X-Encrypted'] = 'true';
@@ -2338,7 +2341,17 @@ function httpRequest(host, port, path, method = 'GET', data = null, encrypt = tr
         }
 
         // Use https or http based on useHttps parameter
-        const client = useHttps ? https : http;
+        let client;
+        if (useHttps) {
+            // For HTTPS, allow self-signed certificates in development
+            const httpsAgent = new https.Agent({
+                rejectUnauthorized: process.env.NODE_ENV !== 'development'
+            });
+            options.agent = httpsAgent;
+            client = https;
+        } else {
+            client = http;
+        }
 
         const req = client.request(options, (res) => {
             let responseData = '';
@@ -2362,9 +2375,16 @@ function httpRequest(host, port, path, method = 'GET', data = null, encrypt = tr
             });
         });
 
-        req.on('error', reject);
+        req.on('error', (e) => {
+            console.error(`[HTTP] Request to ${host}:${port}${path} failed: ${e.message}`);
+            reject(e);
+        });
+
+        // Send data after connection
         if (payload) {
-            req.write(JSON.stringify(payload));
+            // If payload is already a string, don't stringify again
+            const dataToSend = typeof payload === 'string' ? payload : JSON.stringify(payload);
+            req.write(dataToSend);
         }
         req.end();
     });
