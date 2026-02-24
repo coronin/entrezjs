@@ -6,6 +6,7 @@
 |---------|--------|-------------|
 | 2.0.0 | EntrezAJAX | Original Python version on Google App Engine |
 | 3.0.1 | EntrezJS | Node.js rewrite in production |
+| 3.0.2 | EntrezJS | xml2js for XML parsing, DTD support |
 
 ## About
 
@@ -20,17 +21,20 @@ Published in: Loman, N. and M. Pallen (2010). "EntrezJS: direct web browser acce
 ```
 entrezjs/
 ├ ─server.js               # Node.js server implementation (EntrezJS)
-├ package.json            # NPM package configuration
-├ ─test.js                 # Test suite
-├ ─.env                    # Sensitive config (Queen: API keys, SMTP, webhook)
-├ ─.env.example            # Example config template
-├ ─api_keys.json           # Registered API keys (runtime generated)
-├ ─api_keys_pending.json   # Pending email verifications
-├ ─api_keys.backup.*.json  # Backups with timestamps
-├ ─trending.json           # Daily trending data
-├ ─bees.json               # Registered bee servers (queen only)
-├ ─shared_cache.json       # Shared cache metadata
-└ ─banned_ips.json         # Blocked IPs
+├ package.json             # NPM package configuration (requires xml2js)
+├ package-lock.json       # NPM lock file
+├ test.js                  # Test suite
+├ .env                     # Sensitive config (Queen: API keys, SMTP, webhook)
+├ .env.example             # Example config template
+├ api_keys.json            # Registered API keys (runtime generated)
+├ api_keys_pending.json    # Pending email verifications
+├ api_keys.backup.*.json   # Backups with timestamps
+├ trending.json            # Daily trending data
+├ bees.json                # Registered bee servers (queen only)
+├ shared_cache.json        # Shared cache metadata
+├ banned_ips.json          # Blocked IPs
+└ dtd/                     # NCBI DTD files for XML parsing
+   └ pubmed_250101.dtd     # PubMed DTD
 ```
 
 ## Node.js Implementation (EntrezJS)
@@ -41,7 +45,8 @@ The Node.js version (`server.js`) provides all the functionality of the original
 
 | Feature | Description |
 |---------|-------------|
-| **Zero Dependencies** | No npm install required - uses only Node.js built-in modules |
+| **xml2js XML Parsing** | Uses xml2js library for robust XML parsing |
+| **DTD Support** | NCBI DTD files for accurate efetch parsing |
 | **Caching** | 24-hour in-memory cache with GZIP compression |
 | **Memory Management** | Auto cleanup when memory > 80% |
 | **Email Verification** | Registration requires email verification |
@@ -56,16 +61,22 @@ The Node.js version (`server.js`) provides all the functionality of the original
 | **Encryption** | AES-256-GCM for Queen-Bee communication |
 | **SSRF Protection** | Blocks private/internal IPs on bee registration |
 
-### Quick Start (No npm install required!)
+### Quick Start
 
 ```bash
-# Just copy the files and run - no dependencies needed!
+# Install dependencies
+npm install
+
+# Run the server
 node server.js
 ```
 
 ### Running the Node.js Server
 
 ```bash
+# Install dependencies first
+npm install
+
 # Standalone/Bee mode (uses defaults)
 node server.js
 
@@ -227,10 +238,12 @@ On second queen join:
 Matches Python EntrezAJAX format:
 
 ```javascript
-// esummary: [{ "Id": "12345", "Title": "...", "Authors": "..." }, ...]
+// esearch: { Count: 12345, IdList: ["123", "456"], RetMax: 20, RetStart: 0, QueryTranslation: "..." }
+// esummary: [{ Id: { Type: "Integer", Content: 12345 }, Title: { Type: "String", Content: "..." } }, ...]
 // elink: [{ "pubmed": ["123", "456"] }, { "protein": ["789"] }]
-// einfo: { "DbList": [...], "DbInfo": { "pubmed": {...} } }
+// einfo: { DbList: [...], DbInfo: { pubmed: {...} } }
 // espell: { "pubmed": "cancer" }
+// efetch (PubMed XML): [{ PMID: 12345, Title: "...", Authors: [...], Journal: "...", Abstract: "..." }, ...]
 ```
 
 ## Configuration

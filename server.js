@@ -8,6 +8,7 @@ const querystring = require('querystring');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const xml2js = require('xml2js');
 
 // ============================================================
 // Load .env file for sensitive configuration (QUEEN only)
@@ -1274,7 +1275,7 @@ function getKeyUsageStats() {
 }
 
 // Make request to NCBI E-utilities
-async function ncbiRequest(entrezFunction, params) {
+async function ncbiRequest(entrezFunction, params, raw = false) {
     // Record this request for rate tracking
     recordRequest();
 
@@ -1301,13 +1302,18 @@ async function ncbiRequest(entrezFunction, params) {
             }
         };
 
-        const req = https.request(options, (res) => {
+        const req = https.request(options, async (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
-            res.on('end', () => {
+            res.on('end', async () => {
                 try {
-                    const result = parseXmlToJson(data);
-                    resolve(result);
+                    // If raw=true, return data as-is (for efetch text/abstract modes)
+                    if (raw) {
+                        resolve(data);
+                    } else {
+                        const result = await parseXmlToJson(data);
+                        resolve(result);
+                    }
                 } catch (e) {
                     reject(e);
                 }
@@ -1319,178 +1325,277 @@ async function ncbiRequest(entrezFunction, params) {
     });
 }
 
-// Parse NCBI XML response to JSON (simplified - handles common response types)
+// Parse NCBI XML response to JSON using xml2js
+// Format matches Python Biopython Entrez.read() output
 function parseXmlToJson(xml) {
-    // Handle JSON responses directly (if retmode=json)
-    try {
-        return JSON.parse(xml);
-    } catch (e) {
-        // Not JSON, try simple XML parsing for common structures
-    }
+    return new Promise((resolve, reject) => {
+        // Handle JSON responses directly (if retmode=json)
+        try {
+            return resolve(JSON.parse(xml));
+        } catch (e) {
+            // Not JSON, parse XML
+        }
 
-    // Simple XML parsing for Entrez responses
-    const result = {};
+        // Use xml2js to parse XML
+        const parser = new xml2js.Parser({
+            explicitArray: true,
+            trim: true,
+            mergeAttrs: false,
+            attrkey: '$',
+            charkey: '_'
+        });
 
-    // Handle eSearchResult
-    const esearchMatch = xml.match(/<eSearchResult>([\s\S]*?)<\/eSearchResult>/);
-    if (esearchMatch) {
-        const inner = esearchMatch[1];
-        result.Count = extractXmlValue(inner, 'Count');
-        result.Retranslate = extractXmlValue(inner, 'Retranslate');
-        result.IdList = extractXmlValues(inner, 'Id');
-        result.QueryTranslation = extractXmlValue(inner, 'QueryTranslation');
-        result.RetMax = extractXmlValue(inner, 'RetMax') || result.IdList?.length || 0;
-        result.RetStart = extractXmlValue(inner, 'RetStart') || '0';
-        result.SearchResults = extractXmlValue(inner, 'SearchResults');
-        return result;
-    }
+        parser.parseString(xml, function(err, result) {
+            if (err) {
+                console.error('XML parsing error:', err.message);
+                return resolve(xml);
+            }
 
-    // Handle eSummaryResult
-    const summaryMatch = xml.match(/<eSummaryResult>([\s\S]*?)<\/eSummaryResult>/);
-    if (summaryMatch) {
-        const inner = summaryMatch[1];
-        const docsumMatches = inner.match(/<DocSum>[\s\S]*?<\/DocSum>/g) || [];
-        // Return array (like Python), not dict
-        const results = [];
-        for (const docsum of docsumMatches) {
-            const id = extractXmlValue(docsum, 'Id');
-            const items = {};
-            const itemMatches = docsum.match(/<Item Name="([^"]+)" Type="([^"]+)">([\s\S]*?)<\/Item>/g) || [];
-            for (const item of itemMatches) {
-                const nameMatch = item.match(/Name="([^"]+)"/);
-                const typeMatch = item.match(/Type="([^"]+)"/);
-                if (nameMatch && typeMatch) {
-                    const itemName = nameMatch[1];
-                    const itemType = typeMatch[1];
-                    let content;
+            try {
+                // eSearchResult
+                if (result.eSearchResult) {
+                    const esr = result.eSearchResult;
+                    const idList = esr.IdList?.Id || (Array.isArray(esr.IdList) ? esr.IdList : []);
+                    const ids = Array.isArray(idList) ? idList : [idList];
 
-                    if (itemType === 'List') {
-                        // For List type, extract all nested Item values
-                        const nestedItems = item.match(/<Item Name="[^"]*"[^>]*>([^<]*)<\/Item>/g) || [];
-                        const listValues = [];
-                        for (const nested of nestedItems) {
-                            const nestedMatch = nested.match(/<Item Name="[^"]*"[^>]*>([^<]*)<\/Item>/);
-                            if (nestedMatch) {
-                                listValues.push(nestedMatch[1]);
+                    return resolve({
+                        Count: esr.Count ? parseInt(esr.Count, 10) : 0,
+                        Retranslate: esr.Retranslate || null,
+                        IdList: ids,
+                        QueryTranslation: esr.QueryTranslation || null,
+                        RetMax: esr.RetMax ? parseInt(esr.RetMax, 10) : ids.length,
+                        RetStart: esr.RetStart ? parseInt(esr.RetStart, 10) : 0,
+                        SearchResults: esr.SearchResults || null
+                    });
+                }
+
+                // eSummaryResult
+                if (result.eSummaryResult) {
+                    const summary = result.eSummaryResult;
+                    let docsums = summary.DocSum;
+                    if (!docsums) {
+                        return resolve([]);
+                    }
+                    // Ensure it's an array
+                    if (!Array.isArray(docsums)) {
+                        docsums = [docsums];
+                    }
+
+                    const mapped = docsums.map(docsum => {
+                        const items = {};
+                        let docsumItems = docsum.Item;
+                        if (!docsumItems) {
+                            docsumItems = [];
+                        }
+                        if (!Array.isArray(docsumItems)) {
+                            docsumItems = [docsumItems];
+                        }
+
+                        for (const item of docsumItems) {
+                            const name = item.$.Name;
+                            const type = item.$.Type;
+                            let content = item._;
+
+                            // Handle List type - may have nested Item elements
+                            if (type === 'List' && item.Item) {
+                                let listItems = item.Item;
+                                if (!Array.isArray(listItems)) {
+                                    listItems = [listItems];
+                                }
+                                content = listItems.map(li => li._);
+                            }
+
+                            // Convert Integer to number
+                            if (type === 'Integer' && content !== undefined) {
+                                content = parseInt(content, 10);
+                            }
+
+                            if (content !== undefined) {
+                                items[name] = {
+                                    Type: type,
+                                    Content: content
+                                };
                             }
                         }
-                        content = listValues.length > 0 ? listValues : null;
-                    } else {
-                        // For other types, extract the text content
-                        const valueMatch = item.match(/>([^<]*)<\/Item>/);
-                        content = valueMatch ? valueMatch[1] : null;
 
-                        // Convert Integer to number
-                        if (itemType === 'Integer' && content !== null) {
-                            content = parseInt(content, 10);
+                        // Add Id as Integer
+                        items['Id'] = {
+                            Type: 'Integer',
+                            Content: parseInt(docsum.Id, 10)
+                        };
+
+                        return items;
+                    });
+                    return resolve(mapped);
+                }
+
+                // eLinkResult
+                if (result.eLinkResult) {
+                    const elr = result.eLinkResult;
+                    const results = [];
+
+                    // Try LinkSetDb first
+                    let linksets = elr.LinkSetDb;
+                    if (!linksets) {
+                        // Try LinkSet
+                        linksets = elr.LinkSet;
+                    }
+
+                    if (linksets) {
+                        if (!Array.isArray(linksets)) {
+                            linksets = [linksets];
+                        }
+
+                        for (const ls of linksets) {
+                            const dbTo = ls.DbTo;
+                            let ids = ls.Link?.Id;
+                            if (!ids) {
+                                ids = [];
+                            }
+                            if (!Array.isArray(ids)) {
+                                ids = [ids];
+                            }
+
+                            if (dbTo) {
+                                results.push({ [dbTo]: ids });
+                            }
                         }
                     }
 
-                    if (content !== null) {
-                        items[itemName] = {
-                            Type: itemType,
-                            Content: content
-                        };
+                    if (results.length > 0) {
+                        return resolve(results);
                     }
                 }
-            }
-            // Add Id to the item (as Integer)
-            items['Id'] = { Type: 'Integer', Content: parseInt(id, 10) };
-            results.push(items);
-        }
-        return results;
-    }
 
-    // Handle eLinkResult
-    const elinkMatch = xml.match(/<eLinkResult>([\s\S]*?)<\/eLinkResult>/);
-    if (elinkMatch) {
-        const inner = elinkMatch[1];
-        const linkSetDbMatch = inner.match(/<LinkSetDb>([\s\S]*?)<\/LinkSetDb>/g);
-        if (linkSetDbMatch) {
-            // Return array format (like Python)
-            const linkSetDbs = [];
-            for (const lsdb of linkSetDbMatch) {
-                const dbTo = extractXmlValue(lsdb, 'DbTo');
-                const links = extractXmlValues(lsdb, 'Id');
-                if (dbTo) {
-                    linkSetDbs.push({ [dbTo]: links });
+                // eInfoResult
+                if (result.eInfoResult) {
+                    const eir = result.eInfoResult;
+                    const dbList = eir.DbList?.DbName;
+                    const dbInfos = {};
+
+                    let dbNames = dbList;
+                    if (!dbNames) {
+                        dbNames = [];
+                    }
+                    if (!Array.isArray(dbNames)) {
+                        dbNames = [dbNames];
+                    }
+
+                    let dbinfos = eir.DbInfo;
+                    if (dbinfos) {
+                        if (!Array.isArray(dbinfos)) {
+                            dbinfos = [dbinfos];
+                        }
+                        for (const dbi of dbinfos) {
+                            const dbName = dbi.DbName;
+                            if (dbName) {
+                                // Convert to simple object
+                                const info = {};
+                                for (const [key, val] of Object.entries(dbi)) {
+                                    if (key !== 'DbName') {
+                                        info[key] = val;
+                                    }
+                                }
+                                dbInfos[dbName] = info;
+                            }
+                        }
+                    }
+
+                    return resolve({ DbList: dbNames, DbInfo: dbInfos });
                 }
-            }
-            if (linkSetDbs.length > 0) {
-                return linkSetDbs;
-            }
-        }
-        // Check for LinkSet
-        const linkSetMatch = inner.match(/<LinkSet>([\s\S]*?)<\/LinkSet>/g);
-        if (linkSetMatch) {
-            // Return array format (like Python)
-            const results = [];
-            for (const ls of linkSetMatch) {
-                const dbFrom = extractXmlValue(ls, 'DbFrom');
-                const dbTo = extractXmlValue(ls, 'DbTo');
-                const links = extractXmlValues(ls, 'Id');
-                if (dbFrom && dbTo) {
-                    results.push({ [dbTo]: links });
+
+                // PubMedArticleSet (efetch with rettype=xml)
+                if (result.PubMedArticleSet || result.PubmedArticleSet) {
+                    const articleSet = result.PubMedArticleSet || result.PubmedArticleSet;
+                    let articles = articleSet.PubMedArticle || articleSet.PubmedArticle;
+                    if (!articles) {
+                        return resolve([]);
+                    }
+                    if (!Array.isArray(articles)) {
+                        articles = [articles];
+                    }
+
+                    const mapped = articles.map(article => {
+                        const medline = article.MedlineCitation || article.MedlineCitation;
+                        const pmid = medline?.PMID?._ || medline?.PMID;
+                        const articleData = medline?.Article || {};
+
+                        return {
+                            PMID: pmid ? parseInt(pmid, 10) : null,
+                            Title: articleData.ArticleTitle || null,
+                            Authors: articleData.AuthorList?.map(a => {
+                                const name = [];
+                                if (a.LastName) name.push(a.LastName);
+                                if (a.ForeName) name.push(a.ForeName);
+                                return name.join(' ');
+                            }) || [],
+                            Journal: articleData.Journal?.Title || null,
+                            PubDate: articleData.Journal?.JournalIssue?.PubDate?.Year ||
+                                     articleData.Journal?.JournalIssue?.PubDate?.MedlineDate || null,
+                            Abstract: articleData.Abstract?.AbstractText || null,
+                            Keywords: articleData.KeywordList?.Keyword || [],
+                            MeshHeadingList: articleData.MeshHeadingList?.MeshHeading || []
+                        };
+                    });
+                    return resolve(mapped);
                 }
-            }
-            return results;
-        }
-    }
 
-    // Handle eInfo
-    const einfoMatch = xml.match(/<eInfoResult>([\s\S]*?)<\/eInfoResult>/);
-    if (!einfoMatch) {
-        const dbinfoMatch = xml.match(/<DbInfo ([\s\S]*?)\/>/);
-        if (dbinfoMatch) {
-            return { DbInfo: parseXmlAttributes(dbinfoMatch[1]) };
-        }
-    } else {
-        const inner = einfoMatch[1];
-        const dbList = extractXmlValues(inner, 'DbName');
-        const dbInfos = {};
-        const dbinfoMatches = inner.match(/<DbInfo ([\s\S]*?)\/>/g) || [];
-        for (const dbi of dbinfoMatches) {
-            const attrs = parseXmlAttributes(dbi);
-            const dbName = attrs.DbName;
-            if (dbName) {
-                delete attrs.DbName;
-                dbInfos[dbName] = attrs;
-            }
-        }
-        return { DbList: dbList, DbInfo: dbInfos };
-    }
+                // eSpellResult
+                if (result.eSpellResult) {
+                    const esp = result.eSpellResult;
+                    const suggestions = {};
+                    let suggestionList = esp.Suggestion;
+                    if (!suggestionList) {
+                        return resolve({ Suggestion: {} });
+                    }
+                    if (!Array.isArray(suggestionList)) {
+                        suggestionList = [suggestionList];
+                    }
 
-    // Handle eSpell
-    const espellMatch = xml.match(/<eSpellResult>([\s\S]*?)<\/eSpellResult>/);
-    if (espellMatch) {
-        const inner = espellMatch[1];
-        const suggestions = {};
-        const suggestionsMatch = inner.match(/<Suggestion>[\s\S]*?<\/Suggestion>/g) || [];
-        for (const s of suggestionsMatch) {
-            const db = extractXmlValue(s, 'Db');
-            const term = extractXmlValue(s, 'Term');
-            if (db) {
-                suggestions[db] = term;
-            }
-        }
-        return { Suggestion: suggestions };
-    }
+                    for (const s of suggestionList) {
+                        const db = s.$.Db;
+                        const term = s.$.Term;
+                        if (db) {
+                            suggestions[db] = term;
+                        }
+                    }
+                    return resolve({ Suggestion: suggestions });
+                }
 
-    // For efetch, return raw XML
-    return xml;
+                // Return raw XML if no match
+                return resolve(xml);
+            } catch (e) {
+                console.error('XML parsing error:', e.message);
+                return resolve(xml);
+            }
+        });
+    });
 }
 
 function extractXmlValue(xml, tag) {
-    const match = xml.match(new RegExp(`<${tag}>([^<]*)</${tag}>`));
-    return match ? match[1] : null;
+    // First try regular opening/closing tags
+    let match = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
+    if (match) {
+        return match[1].trim();
+    }
+    // Try self-closing tags
+    match = xml.match(new RegExp(`<${tag}[^>]*\\s*/>`));
+    if (match) {
+        return '';
+    }
+    return null;
 }
 
 function extractXmlValues(xml, tag) {
-    const regex = new RegExp(`<${tag}>([^<]*)</${tag}>`, 'g');
+    // Use [\s\S]*? to match any content including newlines
+    const regex = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'g');
     const matches = [];
     let match;
     while ((match = regex.exec(xml)) !== null) {
-        matches.push(match[1]);
+        const value = match[1].trim();
+        if (value) {
+            matches.push(value);
+        }
     }
     return matches;
 }
@@ -1592,13 +1697,24 @@ async function handleEsearch(req, res, query) {
 async function handleEsummary(req, res, query) {
     const params = filterParams('esummary', query);
     const result = await executeAndCache('esummary', req.entrezajax_developer_registration, params);
-    sendJsonResponse(res, { result: result }, 200, query);
+    sendJsonResponse(res, result, 200, query); // LC
 }
 
 async function handleEfetch(req, res, query) {
     const params = filterParams('efetch', query);
-    const result = await executeAndCache('efetch', req.entrezajax_developer_registration, params);
-    sendJsonResponse(res, { result: result }, 200, query);
+    const retmode = params.retmode || 'xml';
+
+    // For efetch, we need to bypass the auto-parsing in ncbiRequest
+    // and handle it based on retmode
+    const reg = req.entrezajax_developer_registration;
+    const result = await ncbiRequest('efetch', {
+        ...params,
+        email: reg.email,
+        tool: reg.toolId,
+        usehistory: 'y'
+    }, retmode !== 'xml'); // pass raw=true if not xml mode
+
+    sendJsonResponse(res, result, 200, query);
 }
 
 async function handleElink(req, res, query) {
