@@ -47,12 +47,12 @@ const DOMAIN_SUFFIX = process.env.DOMAIN_SUFFIX || 'cccc.cn';
 
 // QUEEN ADDRESS (for bee mode only)
 const QUEEN_HOST = process.env.QUEEN_HOST || '';      // e.g., '192.168.1.100'
-const QUEEN_PORT = process.env.QUEEN_PORT || '8080';
+const QUEEN_PORT = parseInt(process.env.QUEEN_PORT || '8080', 10);
 const QUEEN_HTTPS = process.env.QUEEN_HTTPS === 'true' || process.env.QUEEN_HTTPS === '1';  // Set to 'true' if queen uses HTTPS
 
 // First queen address (for second queen joining)
 const FIRST_QUEEN_HOST = process.env.FIRST_QUEEN_HOST || '';
-const FIRST_QUEEN_PORT = process.env.FIRST_QUEEN_PORT || '8080';
+const FIRST_QUEEN_PORT = parseInt(process.env.FIRST_QUEEN_PORT || '8080', 10);
 const FIRST_QUEEN_HTTPS = process.env.FIRST_QUEEN_HTTPS === 'true' || process.env.FIRST_QUEEN_HTTPS === '1';
 
 // ============================================================
@@ -79,12 +79,8 @@ const CONFIG = {
     keyFile: process.env.KEY_FILE || 'privkey.pem',
     certFile: process.env.CERT_FILE || 'fullchain.pem',
 
-    // Server URL - auto-generated from domain if not set
-    serverUrl: process.env.SERVER_URL || (SERVER_CODE_NAME && SERVER_CODE_NAME !== 'bee01'
-        ? `https://${SERVER_CODE_NAME}.${DOMAIN_SUFFIX}:${process.env.PORT || 8080}`
-        : `https://localhost:${process.env.PORT || 8080}`),
     smtpHost: process.env.SMTP_HOST || '',
-    smtpPort: process.env.SMTP_PORT || 587,
+    smtpPort: parseInt(process.env.SMTP_PORT || '587', 10),
     smtpUser: process.env.SMTP_USER || '',
     smtpPass: process.env.SMTP_PASS || '',
     smtpFrom: process.env.SMTP_FROM || '',  // Sender email address (e.g., noreply@yourdomain.com)
@@ -117,6 +113,10 @@ const CONFIG = {
     // Shared cache file
     sharedCacheFile: path.join(__dirname, 'shared_cache.json')
 };
+// Server URL - auto-generated from domain if not set
+CONFIG.serverUrl = process.env.SERVER_URL || (SERVER_CODE_NAME && SERVER_CODE_NAME !== 'bee01'
+    ? `https://${SERVER_CODE_NAME}.${DOMAIN_SUFFIX}:${CONFIG.port}`
+    : `https://localhost:${CONFIG.port}`)
 
 // ============================================================
 // Encryption for Queen-Bee communication
@@ -877,10 +877,14 @@ function loadTrendingData() {
     }
 }
 
-// Save trending data to file
+// Save trending data to file (without timestamp)
 function saveTrendingData() {
     try {
-        fs.writeFileSync(CONFIG.trendingFile, JSON.stringify(trendingData, null, 2));
+        const dataToSave = {
+            topSearchTerms: trendingData.topSearchTerms,
+            topPmids: trendingData.topPmids
+        };
+        fs.writeFileSync(CONFIG.trendingFile, JSON.stringify(dataToSave, null, 2));
         console.log(`[TRENDING] Saved trending data to ${CONFIG.trendingFile}`);
     } catch (e) {
         console.error(`[TRENDING] Failed to save trending data: ${e.message}`);
@@ -987,6 +991,42 @@ async function postToSlack() {
         return;
     }
 
+    // Compare with previous trending data - only post if changed
+    const previousTrendingFile = path.join(__dirname, 'trending_previous.json');
+    let previousTrending = null;
+    try {
+        if (fs.existsSync(previousTrendingFile)) {
+            previousTrending = JSON.parse(fs.readFileSync(previousTrendingFile, 'utf8'));
+        }
+    } catch (e) {
+        // Ignore errors reading previous file
+    }
+
+    // Create hash of current data for comparison (exclude lastUpdated timestamp)
+    const dataForHash = {
+        topSearchTerms: trendingData.topSearchTerms,
+        topPmids: trendingData.topPmids
+    };
+    const currentHash = crypto.createHash('md5').update(JSON.stringify(dataForHash)).digest('hex');
+
+    const previousDataForHash = previousTrending ? {
+        topSearchTerms: previousTrending.topSearchTerms,
+        topPmids: previousTrending.topPmids
+    } : null;
+    const previousHash = previousDataForHash ? crypto.createHash('md5').update(JSON.stringify(previousDataForHash)).digest('hex') : '';
+
+    if (previousTrending && currentHash === previousHash) {
+        console.log('[SLACK] Trending data unchanged, skipping webhook');
+        return;
+    }
+
+    // Save current as previous for next comparison (without timestamp)
+    try {
+        fs.writeFileSync(previousTrendingFile, JSON.stringify(dataForHash));
+    } catch (e) {
+        console.log('[SLACK] Could not save previous trending data:', e.message);
+    }
+
     const message = {
         text: '📊 *EntrezJS Daily Trending Update*',
         blocks: [
@@ -1072,7 +1112,6 @@ async function updateTrendingData() {
     try {
         trendingData.topSearchTerms = await fetchTopSearchTerms();
         trendingData.topPmids = await fetchTopPmids();
-        trendingData.lastUpdated = new Date().toISOString();
 
         saveTrendingData();
         console.log('[TRENDING] Trending data updated successfully');
@@ -1786,6 +1825,7 @@ function handleRegister(req, res) {
                         }]
                     };
 
+                    console.log(`[REGISTER] Syncing to queen: host=${currentQueen.host}, port=${currentQueen.port}, https=${CONFIG.queenHttps}`);
                     await httpRequest(
                         currentQueen.host,
                         currentQueen.port,
@@ -2314,6 +2354,9 @@ function validateHost(hostname) {
 
 // HTTP/HTTPS helper for inter-server communication (with encryption and SSRF protection)
 function httpRequest(host, port, path, method = 'GET', data = null, encrypt = true, useHttps = false) {
+    // Debug logging
+    console.log(`[HTTP] Request: ${method} ${useHttps ? 'https' : 'http'}://${host}:${port}${path}`);
+
     // SSRF Protection: validate target host
     const validation = validateHost(host);
     if (!validation.valid) {
@@ -2341,17 +2384,12 @@ function httpRequest(host, port, path, method = 'GET', data = null, encrypt = tr
         }
 
         // Use https or http based on useHttps parameter
-        let client;
-        if (useHttps) {
-            // For HTTPS, allow self-signed certificates in development
-            const httpsAgent = new https.Agent({
-                rejectUnauthorized: process.env.NODE_ENV !== 'development'
-            });
-            options.agent = httpsAgent;
-            client = https;
-        } else {
-            client = http;
-        }
+        const client = useHttps ? https : http;
+
+        // Log when connected
+        req.on('connect', (res, socket, head) => {
+            console.log(`[HTTP] Connected to ${host}:${port}`);
+        });
 
         const req = client.request(options, (res) => {
             let responseData = '';
@@ -2377,7 +2415,14 @@ function httpRequest(host, port, path, method = 'GET', data = null, encrypt = tr
 
         req.on('error', (e) => {
             console.error(`[HTTP] Request to ${host}:${port}${path} failed: ${e.message}`);
+            console.error(`[HTTP] Error details:`, e);
             reject(e);
+        });
+
+        // Set timeout
+        req.setTimeout(10000, () => {
+            req.destroy();
+            reject(new Error(`Request timeout to ${host}:${port}`));
         });
 
         // Send data after connection
