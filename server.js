@@ -1515,26 +1515,93 @@ function parseXmlToJson(xml) {
                         articles = [articles];
                     }
 
+                    // Helper to get value from potentially array field
+                    const getVal = (arr, key = '_') => {
+                        if (!arr) return null;
+                        const first = Array.isArray(arr) ? arr[0] : arr;
+                        return first?.[key] ?? (typeof first === 'string' ? first : null);
+                    };
+
                     const mapped = articles.map(article => {
-                        const medline = article.MedlineCitation || article.MedlineCitation;
-                        const pmid = medline?.PMID?._ || medline?.PMID;
-                        const articleData = medline?.Article || {};
+                        // MedlineCitation is an array
+                        const medlineArr = article.MedlineCitation;
+                        if (!medlineArr || !medlineArr[0]) {
+                            return { PMID: null, Title: null, Authors: [], Journal: null, PubDate: null, Abstract: null, Keywords: [], MeshHeadingList: [] };
+                        }
+                        const medline = medlineArr[0];
+
+                        // PMID is array of {_: value, $: attrs}
+                        const pmidObj = medline.PMID;
+                        const pmid = pmidObj ? getVal(pmidObj, '_') : null;
+
+                        // Article is array
+                        const articleArr = medline.Article;
+                        const articleData = articleArr?.[0] || {};
+
+                        // Journal is array
+                        const journalArr = articleData.Journal;
+                        const journal = journalArr?.[0];
+
+                        // Title
+                        const titleArr = articleData.ArticleTitle;
+                        const title = titleArr ? (Array.isArray(titleArr) ? titleArr[0] : titleArr) : null;
+
+                        // Abstract
+                        const abstractArr = articleData.Abstract;
+                        const abstractObj = abstractArr?.[0];
+                        const abstractText = abstractObj?.AbstractText;
+                        const abstract = abstractText ? (Array.isArray(abstractText) ? abstractText[0] : abstractText) : null;
+
+                        // Authors
+                        const authorListArr = articleData.AuthorList;
+                        const authorList = authorListArr?.[0]?.Author;
+                        const authors = [];
+                        if (authorList) {
+                            const authorsArr = Array.isArray(authorList) ? authorList : [authorList];
+                            for (const a of authorsArr) {
+                                const lastName = getVal(a.LastName);
+                                const foreName = getVal(a.ForeName);
+                                if (lastName) {
+                                    authors.push(foreName ? `${foreName} ${lastName}` : lastName);
+                                }
+                            }
+                        }
+
+                        // Journal title
+                        const journalTitle = journal?.Title ? (Array.isArray(journal.Title) ? journal.Title[0] : journal.Title) : null;
+
+                        // PubDate
+                        const journalIssue = journal?.JournalIssue?.[0];
+                        const pubDate = journalIssue?.PubDate?.[0];
+                        const pubYear = pubDate?.Year ? (Array.isArray(pubDate.Year) ? pubDate.Year[0] : pubDate.Year) : null;
+                        const pubMedlineDate = pubDate?.MedlineDate ? (Array.isArray(pubDate.MedlineDate) ? pubDate.MedlineDate[0] : pubDate.MedlineDate) : null;
+                        const pubDateStr = pubYear || pubMedlineDate;
+
+                        // Keywords
+                        const keywordListArr = articleData.KeywordList;
+                        const keywordList = keywordListArr?.[0]?.Keyword;
+                        let keywords = [];
+                        if (keywordList) {
+                            keywords = Array.isArray(keywordList) ? keywordList.map(k => typeof k === 'string' ? k : k._).filter(Boolean) : [typeof keywordList === 'string' ? keywordList : keywordList._].filter(Boolean);
+                        }
+
+                        // MeshHeadings
+                        const meshListArr = articleData.MeshHeadingList;
+                        const meshList = meshListArr?.[0]?.MeshHeading;
+                        let meshHeadings = [];
+                        if (meshList) {
+                            meshHeadings = Array.isArray(meshList) ? meshList.map(m => m.DescriptorName?.[0]?._ || m.DescriptorName?._).filter(Boolean) : [meshList.DescriptorName?.[0]?._ || meshList.DescriptorName?._].filter(Boolean);
+                        }
 
                         return {
                             PMID: pmid ? parseInt(pmid, 10) : null,
-                            Title: articleData.ArticleTitle || null,
-                            Authors: articleData.AuthorList?.map(a => {
-                                const name = [];
-                                if (a.LastName) name.push(a.LastName);
-                                if (a.ForeName) name.push(a.ForeName);
-                                return name.join(' ');
-                            }) || [],
-                            Journal: articleData.Journal?.Title || null,
-                            PubDate: articleData.Journal?.JournalIssue?.PubDate?.Year ||
-                                     articleData.Journal?.JournalIssue?.PubDate?.MedlineDate || null,
-                            Abstract: articleData.Abstract?.AbstractText || null,
-                            Keywords: articleData.KeywordList?.Keyword || [],
-                            MeshHeadingList: articleData.MeshHeadingList?.MeshHeading || []
+                            Title: title,
+                            Authors: authors,
+                            Journal: journalTitle,
+                            PubDate: pubDateStr,
+                            Abstract: abstract,
+                            Keywords: keywords,
+                            MeshHeadingList: meshHeadings
                         };
                     });
                     return resolve(mapped);
