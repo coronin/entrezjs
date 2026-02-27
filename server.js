@@ -2291,6 +2291,18 @@ async function handleRequest(req, res) {
     try {
         // Routes
         switch (pathname) {
+            case '/':
+            case '':
+                // Root path - check API key, return 200 if valid
+                checkApiKey(req, res, (query) => {
+                    sendJsonResponse(res, {
+                        status: 'ok',
+                        message: 'EntrezJS API is running',
+                        version: '3.0.2'
+                    }, 200, query);
+                });
+                break;
+
             case '/espell':
                 checkApiKey(req, res, q => handleEspell(req, res, q));
                 break;
@@ -2613,10 +2625,10 @@ function httpRequest(host, port, path, method = 'GET', data = null, encrypt = tr
         // Use https or http based on useHttps parameter
         const client = useHttps ? https : http;
 
-        // Log when connected
-        req.on('connect', (res, socket, head) => {
-            console.log(`[HTTP] Connected to ${host}:${port}`);
-        });
+        // For HTTPS, handle certificate errors gracefully
+        if (useHttps) {
+            options.rejectUnauthorized = false; // Allow self-signed certs for internal use
+        }
 
         const req = client.request(options, (res) => {
             let responseData = '';
@@ -2642,6 +2654,7 @@ function httpRequest(host, port, path, method = 'GET', data = null, encrypt = tr
 
         req.on('error', (e) => {
             console.error(`[HTTP] Request to ${host}:${port}${path} failed: ${e.message}`);
+            console.error(`[HTTP] Error code:`, e.code);
             console.error(`[HTTP] Error details:`, e);
             reject(e);
         });
@@ -2678,7 +2691,9 @@ async function syncToQueen() {
                 myApiKeys.push({
                     key: key,
                     toolId: value.toolId,
-                    email: value.email
+                    email: value.email,
+                    contactName: value.contactName || null,
+                    websiteUrl: value.websiteUrl || null
                 });
             }
         }
@@ -2718,14 +2733,33 @@ async function syncToQueen() {
         if (result.apiKeys) {
             // Merge API keys from queen
             for (const ak of result.apiKeys) {
-                if (!apiKeyStore.keys.has(ak.key)) {
+                const existing = apiKeyStore.keys.get(ak.key);
+                if (!existing) {
+                    // New key - add it
                     apiKeyStore.keys.set(ak.key, {
-                        contactName: 'synced',
+                        contactName: ak.contactName || 'synced',
+                        websiteUrl: ak.websiteUrl || null,
                         email: ak.email,
                         toolId: ak.toolId,
                         verified: true,
                         createdOn: new Date().toISOString()
                     });
+                } else {
+                    // Existing key - merge with more complete info
+                    const merged = { ...existing };
+                    if (!merged.contactName || merged.contactName === 'synced') {
+                        merged.contactName = ak.contactName || merged.contactName;
+                    }
+                    if (!merged.websiteUrl && ak.websiteUrl) {
+                        merged.websiteUrl = ak.websiteUrl;
+                    }
+                    if (!merged.email && ak.email) {
+                        merged.email = ak.email;
+                    }
+                    if (!merged.toolId && ak.toolId) {
+                        merged.toolId = ak.toolId;
+                    }
+                    apiKeyStore.keys.set(ak.key, merged);
                 }
             }
             apiKeyStore.save();
@@ -2767,14 +2801,33 @@ async function collectFromBees() {
             // Merge API keys
             if (response.apiKeys) {
                 for (const ak of response.apiKeys) {
-                    if (!apiKeyStore.keys.has(ak.key)) {
+                    const existing = apiKeyStore.keys.get(ak.key);
+                    if (!existing) {
+                        // New key - add it
                         apiKeyStore.keys.set(ak.key, {
-                            contactName: 'synced',
+                            contactName: ak.contactName || 'synced',
+                            websiteUrl: ak.websiteUrl || null,
                             email: ak.email,
                             toolId: ak.toolId,
                             verified: true,
                             createdOn: new Date().toISOString()
                         });
+                    } else {
+                        // Existing key - merge with more complete info
+                        const merged = { ...existing };
+                        if (!merged.contactName || merged.contactName === 'synced') {
+                            merged.contactName = ak.contactName || merged.contactName;
+                        }
+                        if (!merged.websiteUrl && ak.websiteUrl) {
+                            merged.websiteUrl = ak.websiteUrl;
+                        }
+                        if (!merged.email && ak.email) {
+                            merged.email = ak.email;
+                        }
+                        if (!merged.toolId && ak.toolId) {
+                            merged.toolId = ak.toolId;
+                        }
+                        apiKeyStore.keys.set(ak.key, merged);
                     }
                 }
             }
@@ -2930,14 +2983,33 @@ function handleInternalRequest(req, res, pathname, query) {
                 // Merge data
                 if (data.apiKeys) {
                     for (const ak of data.apiKeys) {
-                        if (!apiKeyStore.keys.has(ak.key)) {
+                        const existing = apiKeyStore.keys.get(ak.key);
+                        if (!existing) {
+                            // New key - add it
                             apiKeyStore.keys.set(ak.key, {
-                                contactName: 'synced',
+                                contactName: ak.contactName || 'synced',
+                                websiteUrl: ak.websiteUrl || null,
                                 email: ak.email,
                                 toolId: ak.toolId,
                                 verified: true,
                                 createdOn: new Date().toISOString()
                             });
+                        } else {
+                            // Existing key - merge with more complete info
+                            const merged = { ...existing };
+                            if (!merged.contactName || merged.contactName === 'synced') {
+                                merged.contactName = ak.contactName || merged.contactName;
+                            }
+                            if (!merged.websiteUrl && ak.websiteUrl) {
+                                merged.websiteUrl = ak.websiteUrl;
+                            }
+                            if (!merged.email && ak.email) {
+                                merged.email = ak.email;
+                            }
+                            if (!merged.toolId && ak.toolId) {
+                                merged.toolId = ak.toolId;
+                            }
+                            apiKeyStore.keys.set(ak.key, merged);
                         }
                     }
                 }
@@ -2954,7 +3026,13 @@ function handleInternalRequest(req, res, pathname, query) {
                 // Get all API keys and blocked IPs to share
                 const allApiKeys = [];
                 for (const [key, value] of apiKeyStore.keys) {
-                    allApiKeys.push({ key, email: value.email, toolId: value.toolId });
+                    allApiKeys.push({
+                        key,
+                        email: value.email,
+                        toolId: value.toolId,
+                        contactName: value.contactName || null,
+                        websiteUrl: value.websiteUrl || null
+                    });
                 }
 
                 const responseData = {
