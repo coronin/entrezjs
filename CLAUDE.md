@@ -20,9 +20,9 @@ Published in: Loman, N. and M. Pallen (2010). "EntrezJS: direct web browser acce
 
 ```
 entrezjs/
-├ ─server.js               # Node.js server implementation (EntrezJS)
+├ server.js                # Node.js server implementation (EntrezJS)
 ├ package.json             # NPM package configuration (requires xml2js)
-├ package-lock.json       # NPM lock file
+├ package-lock.json        # NPM lock file
 ├ test.js                  # Test suite
 ├ .env                     # Sensitive config (Queen: API keys, SMTP, webhook)
 ├ .env.example             # Example config template
