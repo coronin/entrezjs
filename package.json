@@ -1,6 +1,6 @@
 {
   "name": "entrezjs",
-  "version": "3.0.2",
+  "version": "3.0.3",
   "description": "EntrezJS - NCBI Entrez API proxy with JSON/JSONP and caching",
   "main": "server.js",
   "engines": {

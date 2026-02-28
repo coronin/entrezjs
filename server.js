@@ -2603,14 +2603,12 @@ function httpRequest(host, port, path, method = 'GET', data = null, encrypt = tr
     }
 
     return new Promise((resolve, reject) => {
-        // Force IPv4 to avoid DNS resolution issues (some systems return IPv6, some return IPv4)
-        // This ensures consistent behavior across different environments
         const options = {
             hostname: host,
             port: port,
             path: path,
             method: method,
-            family: 4, // Force IPv4 only
+            // family: 4, // Force IPv4 only
             headers: {
                 'Content-Type': 'application/json',
                 'User-Agent': 'EntrezJS/3.0-Distributed'

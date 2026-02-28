@@ -6,7 +6,8 @@
 |---------|--------|-------------|
 | 2.0.0 | EntrezAJAX | Original Python version on Google App Engine |
 | 3.0.1 | EntrezJS | Node.js rewrite in production |
-| 3.0.2 | EntrezJS | xml2js for XML parsing, DTD support |
+| 3.0.2 | EntrezJS | xml2js, efetch PubMed parsing, sync improvements |
+| 3.0.3 | EntrezJS | Root endpoint, bot protection |
 
 ## About
 
@@ -47,7 +48,11 @@ The Node.js version (`server.js`) provides all the functionality of the original
 |---------|-------------|
 | **xml2js XML Parsing** | Uses xml2js library for robust XML parsing |
 | **DTD Support** | NCBI DTD files for accurate efetch parsing |
-| **Caching** | 24-hour in-memory cache with GZIP compression |
+| **PubMed XML Parsing** | efetch returns PMID, Title, Authors, Journal, Abstract, etc. |
+| **Root Endpoint** | `/?apikey=xxx` returns 200 if valid, 403 if invalid |
+| **Bot Protection** | Invalid API key attempts tracked, 5+ violations = IP ban |
+| **Sync Improvements** | contactName/websiteUrl preserved, merge with complete info |
+| **Self-signed Cert Support** | Internal HTTPS works with self-signed certificates |
 | **Memory Management** | Auto cleanup when memory > 80% |
 | **Email Verification** | Registration requires email verification |
 | **API Key Rotation** | Adaptive - only use keys when > 5 req/s |
@@ -269,13 +274,16 @@ curl -X POST https://localhost:8080/register \
 # 2. Check email for verification link
 # Click the /verify?key=xxx&token=xxx link
 
-# 3. Use the API
+# 3. Test API key is valid (root endpoint)
+curl "https://localhost:8080/?apikey=YOUR_API_KEY"
+
+# 4. Use the API
 curl "https://localhost:8080/esearch?apikey=YOUR_API_KEY&db=pubmed&term=cancer"
 
-# 4. JSONP callback
+# 5. JSONP callback
 curl "https://localhost:8080/esearch?apikey=YOUR_API_KEY&db=pubterm=cancer&callback=myFunc"
 
-# 5. Check status
+# 6. Check status
 curl https://localhost:8080/status/memcache
 curl https://localhost:8080/status/trending
 curl https://localhost:8080/status/keys
